@@ -566,7 +566,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                  epsilon=0.5,
                  earth_rotation_time_delay=True,
                  earth_rotation_beam_patterns=True,
-                 finite_size=True):
+                 finite_size=True,
+                 summary_data_chunk_size=2 ** 20):
 
         super(RelativeBinningGravitationalWaveTransientNextGenerationModebyMode, self).__init__(
             interferometers=interferometers,
@@ -605,11 +606,15 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         self.earth_rotation_time_delay = earth_rotation_time_delay
         self.earth_rotation_beam_patterns = earth_rotation_beam_patterns
         self.finite_size = finite_size
-        # self.fiducial_polarizations = None
-        self.fiducial_polarizations = dict()  # change
+        # Frequency samples processed at once when building the summary data.
+        # Keeping this well below the full band means the full-resolution
+        # fiducial waveform never has to be held in memory at once.
+        self.summary_data_chunk_size = summary_data_chunk_size
+        self._fiducial_converted_parameters = None
         # self.per_detector_fiducial_waveforms = dict()
         # self.per_detector_fiducial_waveform_points = dict()
-        self.per_detector_per_mode_fiducial_waveforms = dict()
+        # Only the fiducial waveform sampled at the bin edges is kept; the
+        # full-resolution fiducial waveform is re-projected in chunks on demand.
         self.per_detector_per_mode_fiducial_waveform_points = dict()
         self.bin_freqs = dict()
         self.bin_inds = dict()
@@ -698,10 +703,16 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             for mode in self.mode_array:
                 mode_key = f"{mode[0]},{mode[1]}"
                 self.per_detector_per_mode_fiducial_waveform_points[name][mode_key] = \
-                    self.per_detector_per_mode_fiducial_waveforms[name][mode_key][bin_inds]
+                    self._project_fiducial_mode(
+                        interferometer, self._fiducial_converted_parameters,
+                        mode_key, self.bin_freqs)
 
     def set_fiducial_waveforms(self, parameters):
         """Set fiducial waveforms based on the given parameters.
+
+        No full-resolution waveform is built or stored here: only the sky-frame
+        converted parameters (re-used to re-project the fiducial modes in
+        chunks) and ``self.maximum_frequency`` are computed.
 
         Parameters
         ----------
@@ -712,63 +723,69 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         parameters["fiducial"] = 1
         parameters.update(self.get_sky_frame_parameters(parameters=parameters))
 
-        self.fiducial_polarizations = self.waveform_generator.frequency_domain_strain(parameters)
+        converted_parameters, _ = self.waveform_generator.parameter_conversion(parameters)
+        # Stashed so the fiducial detector waveforms can be re-projected in
+        # chunks later (setup_bins, compute_summary_data, _compute_full_waveform)
+        # instead of storing them at full resolution here.
+        self._fiducial_converted_parameters = converted_parameters
+        self.maximum_frequency = self._fiducial_maximum_frequency(converted_parameters)
+        logger.debug(f"Maximum fiducial frequency: {self.maximum_frequency}")
 
-        if self.fiducial_polarizations is None:
-            raise ValueError(f"Cannot compute fiducial waveforms for {parameters}")
+    def _fiducial_mode_polarizations(self, converted_parameters, mode_key, frequencies):
+        """Evaluate one fiducial mode's plus/cross polarizations at ``frequencies``.
 
-        maximum_nonzero_index = []
-        maximum_nonzero_frequency = []
+        Uses the waveform generator's frequency-sequence evaluation path
+        directly (mirroring how :class:`~bilby.gw.WaveformGenerator` filters and
+        forwards parameters), so an arbitrary sub-band can be produced without
+        building the full-resolution frequency-domain waveform and without
+        disturbing the generator's parameter cache.
+        """
+        ell, emm = (int(part) for part in mode_key.split(","))
+        wfg = self.waveform_generator
+        source_parameters = {
+            key: value for key, value in converted_parameters.items()
+            if key in wfg.source_parameter_keys
+        }
+        source_parameters["fiducial"] = 0
+        waveform_arguments = dict(wfg.waveform_arguments)
+        waveform_arguments["mode_array"] = [[ell, emm]]
+        waveform_arguments["frequency_bin_edges"] = np.asarray(frequencies)
+        source_parameters.update(waveform_arguments)
+        polarizations = wfg.frequency_domain_source_model(
+            wfg.frequency_array, **source_parameters)
+        return polarizations[mode_key]
 
-        waveform_args = self.waveform_generator.waveform_arguments.copy()
+    def _fiducial_maximum_frequency(self, converted_parameters):
+        """Largest frequency at which any fiducial mode is non-zero.
 
-        for interferometer in self.interferometers:
-            self.per_detector_per_mode_fiducial_waveforms[interferometer.name] = dict()
-            logger.debug(f"Maximum Frequency is {interferometer.maximum_frequency}")
+        Evaluated in ``summary_data_chunk_size`` chunks through the
+        frequency-sequence path so no full-resolution waveform is built. This
+        reproduces the legacy full-grid ``!= 0`` criterion (both paths share the
+        waveform model's hard high-frequency cut-off) without its historical
+        off-by-``minimum_frequency`` indexing error.
+        """
+        frequency_array = self.waveform_generator.frequency_array
+        df = frequency_array[1] - frequency_array[0]
+        minimum_frequency = min(ifo.minimum_frequency for ifo in self.interferometers)
+        search_frequencies = frequency_array[frequency_array > (minimum_frequency - df)]
 
-            converted_parameters, _ = self.waveform_generator.parameter_conversion(parameters)
-            frequencies = interferometer.frequency_array
-            idxs_above_minimum_frequency = frequencies > \
-                (interferometer.minimum_frequency - (frequencies[1] - frequencies[0]))
-            freqs = frequencies[idxs_above_minimum_frequency]
+        per_mode_maxima = []
+        for ell, emm in self.mode_array:
+            mode_key = f"{ell},{emm}"
+            last_nonzero_frequency = None
+            for start in range(0, len(search_frequencies), self.summary_data_chunk_size):
+                chunk = search_frequencies[start:start + self.summary_data_chunk_size]
+                plus = self._fiducial_mode_polarizations(
+                    converted_parameters, mode_key, chunk)["plus"]
+                nonzero = np.nonzero(plus)[0]
+                if len(nonzero):
+                    last_nonzero_frequency = chunk[nonzero[-1]]
+            if last_nonzero_frequency is not None:
+                per_mode_maxima.append(last_nonzero_frequency)
 
-            for ell, emm in self.mode_array:
-                mode_key = f"{ell},{emm}"
-                waveform_polarizations_reduced = {mode_key: {
-                    'plus': self.fiducial_polarizations[mode_key]['plus'][idxs_above_minimum_frequency],
-                    'cross': self.fiducial_polarizations[mode_key]['cross'][idxs_above_minimum_frequency]
-                }}
-
-                nonzero_indices = np.where(waveform_polarizations_reduced[mode_key]["plus"] != 0j)[0]
-                if len(nonzero_indices) > 0:
-                    max_idx = nonzero_indices[-1]
-                    maximum_nonzero_index.append(max_idx)
-                    max_freq = self.waveform_generator.frequency_array[max_idx]
-                    maximum_nonzero_frequency.append(max_freq)
-
-                    logger.debug(f"Maximum Nonzero Index for mode ({ell},{emm}): {max_idx}")
-                    logger.debug(f"Maximum Nonzero Frequency for mode ({ell},{emm}): {max_freq}")
-
-                wf = np.zeros_like(interferometer.frequency_array, dtype=complex)
-                wf[idxs_above_minimum_frequency] = \
-                    interferometer.get_detector_response_for_frequency_dependent_antenna_response(
-                        waveform_polarizations=waveform_polarizations_reduced,
-                        parameters=converted_parameters,
-                        start_time=interferometer.strain_data.start_time,
-                        frequencies=freqs,
-                        earth_rotation_time_delay=self.earth_rotation_time_delay,
-                        earth_rotation_beam_patterns=self.earth_rotation_beam_patterns,
-                        finite_size=self.finite_size
-                    )
-
-                if maximum_nonzero_frequency:
-                    self.maximum_frequency = min(maximum_nonzero_frequency)
-                else:
-                    self.maximum_frequency = interferometer.maximum_frequency
-
-                wf[frequencies > self.maximum_frequency] = 0
-                self.per_detector_per_mode_fiducial_waveforms[interferometer.name][mode_key] = wf
-            self.waveform_generator.waveform_arguments = waveform_args.copy()
+        if per_mode_maxima:
+            return min(per_mode_maxima)
+        return min(ifo.maximum_frequency for ifo in self.interferometers)
 
     def find_maximum_likelihood_parameters(self, parameter_bounds,
                                            iterations=5, maximization_kwargs=None):
@@ -852,8 +869,63 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             bounds.append([priors[key].minimum, priors[key].maximum])
         return bounds
 
+    def _project_fiducial_mode(self, interferometer, converted_parameters, mode_key, frequencies):
+        """Project one mode's fiducial polarizations onto ``interferometer``.
+
+        The fiducial polarizations for the requested ``frequencies`` are
+        evaluated on demand through the waveform generator's frequency-sequence
+        path, so callers can walk the band in chunks rather than building and
+        storing a full-resolution detector waveform for every detector and mode.
+        """
+        full_frequencies = interferometer.frequency_array
+        frequencies = np.asarray(frequencies)
+        df = full_frequencies[1] - full_frequencies[0]
+        above_minimum_frequency = frequencies > (interferometer.minimum_frequency - df)
+        freqs = frequencies[above_minimum_frequency]
+
+        mode_polarizations = self._fiducial_mode_polarizations(
+            converted_parameters, mode_key, freqs)
+        waveform_polarizations_reduced = {mode_key: {
+            'plus': mode_polarizations['plus'],
+            'cross': mode_polarizations['cross'],
+        }}
+
+        wf = np.zeros(len(frequencies), dtype=complex)
+        wf[above_minimum_frequency] = \
+            interferometer.get_detector_response_for_frequency_dependent_antenna_response(
+                waveform_polarizations=waveform_polarizations_reduced,
+                parameters=converted_parameters,
+                start_time=interferometer.strain_data.start_time,
+                frequencies=freqs,
+                earth_rotation_time_delay=self.earth_rotation_time_delay,
+                earth_rotation_beam_patterns=self.earth_rotation_beam_patterns,
+                finite_size=self.finite_size)
+        wf[frequencies > self.maximum_frequency] = 0
+        return wf
+
+    def _bin_chunks(self, masked_bin_inds):
+        """Yield ``(start_bin, end_bin)`` ranges of consecutive bins whose
+        combined frequency span stays within ``summary_data_chunk_size``
+        samples (always at least one bin per chunk)."""
+        number_of_bins = self.number_of_bins
+        start = 0
+        while start < number_of_bins:
+            end = start + 1
+            while (end < number_of_bins and
+                   masked_bin_inds[end + 1] - masked_bin_inds[start]
+                   <= self.summary_data_chunk_size):
+                end += 1
+            yield start, end
+            start = end
+
     def compute_summary_data(self):
-        """Compute summary data for the likelihood."""
+        """Compute summary data for the likelihood.
+
+        The per-mode fiducial detector waveforms are projected in frequency
+        chunks of ``summary_data_chunk_size`` samples rather than all at once,
+        so the full-resolution waveform never has to sit in memory. The result
+        is identical to an unchunked computation.
+        """
         summary_data = dict()
 
         for interferometer in self.interferometers:
@@ -882,32 +954,41 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                     b0[key][f'{ellp},{emmp}'], b1[key][f'{ellp},{emmp}'] = \
                         np.zeros((2, self.number_of_bins), dtype=complex)
 
-            for i in range(self.number_of_bins):
-                start_idx = masked_bin_inds[i]
-                end_idx = masked_bin_inds[i + 1]
-                idxs = slice(start_idx, end_idx)
+            for chunk_start, chunk_end in self._bin_chunks(masked_bin_inds):
+                chunk_lo = masked_bin_inds[chunk_start]
+                chunk_hi = masked_bin_inds[chunk_end]
+                chunk_frequencies = masked_frequency_array[chunk_lo:chunk_hi]
+                chunk_strain = masked_strain[chunk_lo:chunk_hi]
+                chunk_psd = masked_psd[chunk_lo:chunk_hi]
+                chunk_h0 = {
+                    f'{ell},{emm}': self._project_fiducial_mode(
+                        interferometer, self._fiducial_converted_parameters,
+                        f'{ell},{emm}', chunk_frequencies)
+                    for ell, emm in self.mode_array
+                }
 
-                frequencies = masked_frequency_array[idxs]
-                central_frequency = (frequencies[0] + frequencies[-1]) / 2
-                delta_frequency = frequencies - central_frequency
+                for i in range(chunk_start, chunk_end):
+                    idxs = slice(masked_bin_inds[i] - chunk_lo,
+                                 masked_bin_inds[i + 1] - chunk_lo)
 
-                strain = masked_strain[idxs]
-                psd = masked_psd[idxs]
+                    frequencies = chunk_frequencies[idxs]
+                    central_frequency = (frequencies[0] + frequencies[-1]) / 2
+                    delta_frequency = frequencies - central_frequency
 
-                for j, (ell, emm) in enumerate(self.mode_array):
-                    key = f'{ell},{emm}'
-                    masked_h0 = self.per_detector_per_mode_fiducial_waveforms[interferometer.name][key][mask]
-                    h0 = masked_h0[idxs]
-                    a0[key][i] = noise_weighted_inner_product(h0, strain, psd, duration)
-                    a1[key][i] = noise_weighted_inner_product(h0, strain * delta_frequency, psd, duration)
+                    strain = chunk_strain[idxs]
+                    psd = chunk_psd[idxs]
 
-                    for ellp, emmp in self.mode_array[j::]:
-                        keyp = f'{ellp},{emmp}'
-                        masked_h0_p = \
-                            self.per_detector_per_mode_fiducial_waveforms[interferometer.name][keyp][mask]
-                        h0_p = masked_h0_p[idxs]
-                        b0[key][keyp][i] = noise_weighted_inner_product(h0_p, h0, psd, duration)
-                        b1[key][keyp][i] = noise_weighted_inner_product(h0_p, h0 * delta_frequency, psd, duration)
+                    for j, (ell, emm) in enumerate(self.mode_array):
+                        key = f'{ell},{emm}'
+                        h0 = chunk_h0[key][idxs]
+                        a0[key][i] = noise_weighted_inner_product(h0, strain, psd, duration)
+                        a1[key][i] = noise_weighted_inner_product(h0, strain * delta_frequency, psd, duration)
+
+                        for ellp, emmp in self.mode_array[j::]:
+                            keyp = f'{ellp},{emmp}'
+                            h0_p = chunk_h0[keyp][idxs]
+                            b0[key][keyp][i] = noise_weighted_inner_product(h0_p, h0, psd, duration)
+                            b1[key][keyp][i] = noise_weighted_inner_product(h0_p, h0 * delta_frequency, psd, duration)
 
             for i, (ell, emm) in enumerate(self.mode_array):
                 key = f'{ell},{emm}'
@@ -970,7 +1051,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 duplicated_r1[idxs] = r1[mode_key][i]
 
             full_waveform_ratio += duplicated_r0 + duplicated_r1 * (f - duplicated_fm)
-            fiducial_waveform = self.per_detector_per_mode_fiducial_waveforms[interferometer.name][mode_key]
+            fiducial_waveform = self._project_fiducial_mode(
+                interferometer, self._fiducial_converted_parameters, mode_key, f)
             full_waveform += full_waveform_ratio * fiducial_waveform
 
         return full_waveform
