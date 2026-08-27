@@ -205,6 +205,8 @@ class MBGravitationalWaveTransientNextGeneration(MBGravitationalWaveTransient):
         =======
         snrs: named tuple of SNRs
         """
+        if parameters is not None:
+            self.parameters.update(parameters)
         converted_parameters, _ = self.waveform_generator.parameter_conversion(self.parameters)
         waveform_polarizations_red = {}
         try:
@@ -1074,6 +1076,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         calculated_snrs: namedtuple
             A named tuple containing calculated SNR values.
         """
+        if parameters is not None:
+            self.parameters.update(parameters)
         r0, r1 = self.compute_waveform_ratio_per_interferometer(
             waveform_polarizations=waveform_polarizations,
             interferometer=interferometer,
