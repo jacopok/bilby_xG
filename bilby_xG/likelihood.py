@@ -192,7 +192,7 @@ class MBGravitationalWaveTransientNextGeneration(MBGravitationalWaveTransient):
             )
         self.response_update = response_update
 
-    def calculate_snrs(self, waveform_polarizations, interferometer):
+    def calculate_snrs(self, waveform_polarizations, interferometer, parameters=None):
         """Compute the SNRs for multi-banding with the frequency-dependent response.
 
         Parameters
@@ -1057,7 +1057,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
 
         return full_waveform
 
-    def calculate_snrs(self, waveform_polarizations, interferometer, return_array=True):
+    def calculate_snrs(self, waveform_polarizations, interferometer, return_array=True, parameters=None):
         """Calculate the SNRs (Signal-to-Noise Ratios).
 
         Parameters
