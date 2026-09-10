@@ -93,7 +93,7 @@ class GravitationalWaveTransientNextGeneration(GravitationalWaveTransient):
         self.earth_rotation_time_delay = earth_rotation_time_delay
         self.finite_size = finite_size
 
-    def _compute_full_waveform(self, signal_polarizations, interferometer):
+    def _compute_full_waveform(self, signal_polarizations, interferometer, parameters=None):
         """Project the waveform onto the frequency-dependent detector response.
 
         Parameters
@@ -103,6 +103,11 @@ class GravitationalWaveTransientNextGeneration(GravitationalWaveTransient):
             ``{"plus", "cross"}`` dict or a per-mode nested dict.
         interferometer: bilby.gw.detector.Interferometer
             Interferometer to compute the response with respect to.
+        parameters: dict, optional
+            Parameters to project with; current bilby core's
+            GravitationalWaveTransient.calculate_snrs passes this explicitly
+            (its own ``_compute_full_waveform`` takes the same kwarg). Falls
+            back to ``self.parameters`` when not given, as before.
         """
         frequencies = interferometer.frequency_array
         idxs_above_minimum_frequency = frequencies > \
@@ -123,7 +128,9 @@ class GravitationalWaveTransientNextGeneration(GravitationalWaveTransient):
                 waveform_polarizations_red[key]['cross'] = \
                     signal_polarizations[key]['cross'][idxs_above_minimum_frequency]
         h = np.zeros_like(frequencies, dtype=complex)
-        parameters, _ = self.waveform_generator.parameter_conversion(self.parameters)
+        if parameters is None:
+            parameters = self.parameters
+        parameters, _ = self.waveform_generator.parameter_conversion(parameters)
         h[idxs_above_minimum_frequency] = \
             interferometer.get_detector_response_for_frequency_dependent_antenna_response(
                 waveform_polarizations=waveform_polarizations_red,
