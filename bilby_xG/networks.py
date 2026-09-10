@@ -68,14 +68,21 @@ class TriangularInterferometer(_networks.TriangularInterferometer):
     """A triangular interferometer built from bilby_xG interferometers.
 
     Parameters are as in
-    :class:`bilby.gw.detector.networks.TriangularInterferometer`.
+    :class:`bilby.gw.detector.networks.TriangularInterferometer`, with the
+    addition of ``colocated``: if True, the three channels share the same
+    latitude and longitude rather than being placed at the triangle vertices.
     """
 
     def __init__(self, name, power_spectral_density, minimum_frequency,
                  maximum_frequency, length, latitude, longitude, elevation,
-                 xarm_azimuth, yarm_azimuth, xarm_tilt=0., yarm_tilt=0.):
+                 xarm_azimuth, yarm_azimuth, xarm_tilt=0., yarm_tilt=0.,
+                 colocated=False):
         # Reimplements the upstream constructor so the three channels are
         # bilby_xG Interferometers with the frequency-dependent response.
+        #
+        # If ``colocated`` is True, the three channels share the same latitude
+        # and longitude (only the arm azimuths are rotated by 240 degrees),
+        # instead of being displaced along the vertices of the triangle.
         list.__init__(self)
         self.name = name
         if isinstance(power_spectral_density, _PowerSpectralDensity):
@@ -94,12 +101,13 @@ class TriangularInterferometer(_networks.TriangularInterferometer):
 
             xarm_azimuth += 240
             yarm_azimuth += 240
-            latitude += np.arctan(
-                length * np.sin(xarm_azimuth * np.pi / 180) * 1e3
-                / utils.radius_of_earth) * 180 / np.pi
-            longitude += np.arctan(
-                length * np.cos(xarm_azimuth * np.pi / 180) * 1e3
-                / utils.radius_of_earth) * 180 / np.pi
+            if not colocated:
+                latitude += np.arctan(
+                    length * np.sin(xarm_azimuth * np.pi / 180) * 1e3
+                    / utils.radius_of_earth) * 180 / np.pi
+                longitude += np.arctan(
+                    length * np.cos(xarm_azimuth * np.pi / 180) * 1e3
+                    / utils.radius_of_earth) * 180 / np.pi
 
 
 def load_interferometer(filename):
