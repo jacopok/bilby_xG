@@ -1077,6 +1077,10 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             The interferometer for which to calculate the SNRs.
         return_array: bool, optional
             If True, return the full waveform.
+        parameters: dict, optional
+            The parameters to evaluate at; merged into ``self.parameters``
+            if given, which is otherwise used as-is (deprecated in
+            bilby >= 2.8, kept for callers that still rely on it).
 
         Returns
         -------
