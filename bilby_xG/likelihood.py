@@ -702,6 +702,11 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         self.bin_freqs = bin_freqs
         self.number_of_bins = len(bin_inds) - 1
 
+        logger.info(
+            f"Constructed {self.number_of_bins} relative-binning bins over "
+            f"[{minimum_frequency:.3g}, {maximum_frequency:.3g}] Hz "
+            f"(epsilon={self.epsilon}, chi={self.chi}, gamma={self.gamma.tolist()}).")
+
         self.waveform_generator.waveform_arguments["frequency_bin_edges"] = self.bin_freqs
         self.bin_widths = self.bin_freqs[1:] - self.bin_freqs[:-1]
         self.bin_centers = (self.bin_freqs[1:] + self.bin_freqs[:-1]) / 2
@@ -938,6 +943,9 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         summary_data = dict()
 
         for interferometer in self.interferometers:
+            logger.info(
+                f"Computing summary data for {interferometer.name} "
+                f"({self.number_of_bins} bins).")
             summary_data[interferometer.name] = {
                 'a0': dict(),
                 'a1': dict(),
@@ -975,6 +983,13 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                         f'{ell},{emm}', chunk_frequencies)
                     for ell, emm in self.mode_array
                 }
+
+                logger.info(
+                    f"{interferometer.name}: summary data bins "
+                    f"{chunk_start}-{chunk_end}/{self.number_of_bins} "
+                    f"({chunk_end / self.number_of_bins:.0%}), "
+                    f"frequencies [{chunk_frequencies[0]:.3g}, "
+                    f"{chunk_frequencies[-1]:.3g}] Hz.")
 
                 for i in range(chunk_start, chunk_end):
                     idxs = slice(masked_bin_inds[i] - chunk_lo,
