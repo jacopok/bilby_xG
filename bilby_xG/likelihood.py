@@ -45,6 +45,54 @@ __author__ = [
     "Ish Gupta",
 ]
 
+_DEFAULT_GAMMA = np.array([-5 / 3, -2 / 3, 1, 5 / 3, 7 / 3])
+
+
+def relative_binning_bin_freqs(frequency_array, minimum_frequency, maximum_frequency,
+                                chi=1, epsilon=0.5, gamma=None):
+    """Relative-binning frequency bin edges (Zackay et al. 2018, arXiv:1806.08792).
+
+    A pure function of the candidate frequency grid and the search band --
+    no waveform generator, interferometer or likelihood needed.
+    ``d_phi`` below is a closed-form function of frequency (evaluated
+    pointwise at each ``frequency_array`` entry, not an integral or
+    cumulative sum over it), so ``frequency_array`` only has to be dense
+    enough to place the returned bin edges accurately; it need not be a
+    real data segment's true (uniform-``df``) frequency resolution -- e.g. a
+    log-spaced grid works fine for exploring how ``epsilon``/``chi`` affect
+    the bin count and placement.
+
+    Returns
+    -------
+    bin_freqs: ndarray
+        The bin-edge frequencies (``len(bin_freqs) - 1`` bins).
+    """
+    if gamma is None:
+        gamma = _DEFAULT_GAMMA
+    gamma = gamma[:, np.newaxis]
+
+    frequency_array_useful = frequency_array[
+        (frequency_array >= minimum_frequency)
+        & (frequency_array <= maximum_frequency)
+    ]
+
+    d_alpha = chi * 2 * np.pi / np.abs(
+        (minimum_frequency ** gamma) * np.heaviside(-gamma, 1)
+        - (maximum_frequency ** gamma) * np.heaviside(gamma, 1)
+    )
+    d_phi = np.sum(
+        np.sign(gamma) * d_alpha * frequency_array_useful ** gamma,
+        axis=0
+    )
+    d_phi_from_start = d_phi - d_phi[0]
+    number_of_bins = int(d_phi_from_start[-1] // epsilon)
+
+    bin_edges = np.linspace(0, d_phi_from_start[-1], num=number_of_bins + 1)
+    bin_indices = np.searchsorted(d_phi_from_start, bin_edges)
+    unique_bin_indices = np.unique(bin_indices)
+
+    return frequency_array_useful[unique_bin_indices]
+
 
 class GravitationalWaveTransientNextGeneration(GravitationalWaveTransient):
     """Transient likelihood using the frequency-dependent antenna response.
@@ -676,7 +724,6 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         as wide as this spacing.
         """
         frequency_array = self.waveform_generator.frequency_array
-        gamma = self.gamma[:, np.newaxis]
         # Bin over the intersection of the interferometer frequency ranges,
         # matching bilby's RelativeBinningGravitationalWaveTransient.setup_bins.
         minimum_frequency = np.maximum.reduce(
@@ -685,28 +732,11 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             [ifo.maximum_frequency for ifo in self.interferometers], initial=frequency_array[-1])
         maximum_frequency = min(maximum_frequency, self.maximum_frequency)
 
-        frequency_array_useful = frequency_array[
-            (frequency_array >= minimum_frequency)
-            & (frequency_array <= maximum_frequency)
-        ]
+        bin_freqs = relative_binning_bin_freqs(
+            frequency_array, minimum_frequency, maximum_frequency,
+            chi=self.chi, epsilon=self.epsilon, gamma=self.gamma)
 
-        d_alpha = self.chi * 2 * np.pi / np.abs(
-            (minimum_frequency ** gamma) * np.heaviside(-gamma, 1)
-            - (maximum_frequency ** gamma) * np.heaviside(gamma, 1)
-        )
-        d_phi = np.sum(
-            np.sign(gamma) * d_alpha * frequency_array_useful ** gamma,
-            axis=0
-        )
-        d_phi_from_start = d_phi - d_phi[0]
-        number_of_bins = int(d_phi_from_start[-1] // self.epsilon)
-
-        bin_edges = np.linspace(0, d_phi_from_start[-1], num=number_of_bins + 1)
-        bin_indices = np.searchsorted(d_phi_from_start, bin_edges)
-        unique_bin_indices = np.unique(bin_indices)
-
-        bin_inds = np.searchsorted(frequency_array, frequency_array_useful[unique_bin_indices])
-        bin_freqs = frequency_array_useful[unique_bin_indices]
+        bin_inds = np.searchsorted(frequency_array, bin_freqs)
         self.bin_inds = bin_inds
         self.bin_freqs = bin_freqs
         self.number_of_bins = len(bin_inds) - 1
