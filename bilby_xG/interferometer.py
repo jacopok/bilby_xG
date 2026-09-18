@@ -15,11 +15,13 @@ supplying a :class:`~bilby_xG.propagation.SpeedOfGravity` or
 :class:`~bilby_xG.propagation.ModifiedDispersion` model enables the
 corresponding beyond-GR physics through a single code path.
 """
+import os
+
 import numpy as np
 from bilby_cython.geometry import greenwich_mean_sidereal_time
 from bilby_cython.geometry import time_delay_from_geocenter as _cython_time_delay
 
-from bilby.core.utils import ra_dec_to_theta_phi, speed_of_light
+from bilby.core.utils import logger, ra_dec_to_theta_phi, speed_of_light
 from bilby.gw.detector.calibration import Recalibrate
 from bilby.gw.detector.interferometer import Interferometer as _Interferometer
 
@@ -165,6 +167,85 @@ class Interferometer(_Interferometer):
             fig.savefig('{}/{}_{}_frequency_domain_data.png'.format(
                 outdir, self.name, label))
         plt.close(fig)
+
+    def offload_frequency_domain_strain(self, cache_dir):
+        """Move the full-band frequency-domain strain to a disk-backed array.
+
+        ``strain_data._frequency_domain_strain`` is the one full-band array
+        (O(1e8) complex128 bins at ET's low ``minimum_frequency``) that
+        cannot be cheaply regenerated -- it's the actual (injected or real)
+        data. Writing it to disk once and reopening it memory-mapped means
+        it no longer costs resident memory except for the pages a caller
+        actually touches (e.g. one relative-binning summary-data chunk at a
+        time), and it pickles as a small path/dtype/shape marker instead of
+        its full contents (see :meth:`__getstate__`). Idempotent: a no-op if
+        this interferometer's strain is already memory-mapped.
+        """
+        strain = self.strain_data._frequency_domain_strain
+        if isinstance(strain, np.memmap):
+            return
+        os.makedirs(cache_dir, exist_ok=True)
+        path = os.path.join(cache_dir, f"{self.name}_frequency_domain_strain.npy")
+        np.save(path, strain)
+        self.strain_data._frequency_domain_strain = np.load(path, mmap_mode='r')
+        logger.info(
+            f"{self.name}: offloaded frequency-domain strain to {path} "
+            f"({strain.nbytes / 1e9:.2f} GB).")
+
+    def discard_regenerable_frequency_caches(self):
+        """Drop full-band caches that bilby regenerates lazily and cheaply.
+
+        ``frequency_array``, ``frequency_mask`` (from duration/
+        sampling_frequency/start_time) and the PSD's ``psd_array``/
+        ``asd_array`` (from the PSD file) are all deterministically
+        recomputed by bilby's own properties on next access -- there is no
+        need to keep O(1e8)-element copies of them resident just because
+        something touched them once (e.g. during summary-data computation).
+        """
+        times_and_frequencies = self.strain_data._times_and_frequencies
+        times_and_frequencies._frequency_array = None
+        times_and_frequencies._frequency_array_updated = False
+        self.strain_data._frequency_mask = None
+        self.strain_data._frequency_mask_updated = False
+        self.power_spectral_density._cache = dict(
+            psd_array=None, asd_array=None, frequency_array=None)
+
+    def __getstate__(self):
+        """Pickle the memory-mapped strain as a path, not its full contents.
+
+        ``numpy.memmap`` has no special pickling behaviour of its own -- by
+        default it pickles like any other ``ndarray``, i.e. embeds the full
+        buffer. That would defeat :meth:`offload_frequency_domain_strain`
+        entirely (both for on-disk pickles and for the arrays that travel
+        through a sampler's worker-pool ``initargs``), so this intercepts
+        it explicitly.
+        """
+        state = self.__dict__.copy()
+        strain = state["strain_data"].__dict__.get("_frequency_domain_strain")
+        if isinstance(strain, np.memmap):
+            state = dict(state)
+            state["strain_data"] = state["strain_data"].__class__.__new__(
+                state["strain_data"].__class__)
+            state["strain_data"].__dict__.update(self.strain_data.__dict__)
+            state["strain_data"].__dict__["_frequency_domain_strain"] = (
+                "__diskarray__", strain.filename, str(strain.dtype), strain.shape)
+        return state
+
+    def __setstate__(self, state):
+        strain_data = state.get("strain_data")
+        if strain_data is not None:
+            marker = strain_data.__dict__.get("_frequency_domain_strain")
+            if isinstance(marker, tuple) and marker[:1] == ("__diskarray__",):
+                path = marker[1]
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(
+                        f"{self.__class__.__name__}.__setstate__: disk-backed "
+                        f"frequency-domain strain for {state.get('name')} is "
+                        f"missing at {path} (was the array_cache_dir cleaned "
+                        "up between runs?).")
+                strain_data.__dict__["_frequency_domain_strain"] = np.load(
+                    path, mmap_mode='r')
+        self.__dict__.update(state)
 
     @staticmethod
     def _finite_size_factor(x, y):

@@ -25,6 +25,8 @@ Provides:
   a relative-binning variant that keeps the per-mode decomposition through the
   binning summary data.
 """
+import tempfile
+
 import numpy as np
 from scipy.optimize import differential_evolution
 
@@ -576,7 +578,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                  earth_rotation_time_delay=True,
                  earth_rotation_beam_patterns=True,
                  finite_size=True,
-                 summary_data_chunk_size=2 ** 20):
+                 summary_data_chunk_size=2 ** 20,
+                 array_cache_dir=None):
 
         super(RelativeBinningGravitationalWaveTransientNextGenerationModebyMode, self).__init__(
             interferometers=interferometers,
@@ -619,6 +622,12 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         # Keeping this well below the full band means the full-resolution
         # fiducial waveform never has to be held in memory at once.
         self.summary_data_chunk_size = summary_data_chunk_size
+        if array_cache_dir is None:
+            array_cache_dir = tempfile.mkdtemp(prefix="bilby_xG_array_cache_")
+        self.array_cache_dir = array_cache_dir
+        logger.info(
+            f"Disk-backed full-band array cache: {self.array_cache_dir} "
+            "(must remain until this likelihood is no longer used).")
         self._fiducial_converted_parameters = None
         # self.per_detector_fiducial_waveforms = dict()
         # self.per_detector_fiducial_waveform_points = dict()
@@ -939,10 +948,24 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         chunks of ``summary_data_chunk_size`` samples rather than all at once,
         so the full-resolution waveform never has to sit in memory. The result
         is identical to an unchunked computation.
+
+        The actual (injected/real) strain data is also read in chunks,
+        straight off a disk-backed memory-mapped copy
+        (:meth:`bilby_xG.interferometer.Interferometer.offload_frequency_domain_strain`)
+        rather than through the ``frequency_domain_strain``/
+        ``power_spectral_density_array`` properties -- those recompute and
+        boolean-mask a full-band array (O(1e8) bins) on every access, which
+        is expensive both in itself and because it is done on top of the
+        persistent full-band arrays already held per detector. The PSD is
+        cheap to regenerate from the PSD file, so it is simply recomputed at
+        each chunk's (small) frequency sub-array instead of being cached at
+        full band.
         """
         summary_data = dict()
 
         for interferometer in self.interferometers:
+            interferometer.offload_frequency_domain_strain(self.array_cache_dir)
+            interferometer.discard_regenerable_frequency_caches()
             logger.info(
                 f"Computing summary data for {interferometer.name} "
                 f"({self.number_of_bins} bins).")
@@ -954,11 +977,21 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             }
 
             mask = interferometer.frequency_mask
+            n_in_band = int(np.count_nonzero(mask))
+            raw_offset = int(np.argmax(mask))
+            raw_last = len(mask) - 1 - int(np.argmax(mask[::-1]))
+            is_contiguous = (raw_last - raw_offset + 1) == n_in_band
+            # Only materialise the full index array (an O(1e8)-element int
+            # allocation at ET's low minimum_frequency) in the fallback case;
+            # the masks this pipeline uses (a single [minimum_frequency,
+            # maximum_frequency] band) are always contiguous.
+            in_band_indices = None if is_contiguous else np.flatnonzero(mask)
             masked_frequency_array = interferometer.frequency_array[mask]
             masked_bin_inds = np.searchsorted(masked_frequency_array, self.bin_freqs)
-            masked_strain = interferometer.frequency_domain_strain[mask]
-            masked_psd = interferometer.power_spectral_density_array[mask]
             duration = interferometer.duration
+            raw_strain = interferometer.strain_data._frequency_domain_strain
+            psd_model = interferometer.power_spectral_density
+            window_power_correction = interferometer._window_power_correction
             a0, b0, a1, b1 = dict(), dict(), dict(), dict()
 
             for j, (ell, emm) in enumerate(self.mode_array):
@@ -975,8 +1008,14 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 chunk_lo = masked_bin_inds[chunk_start]
                 chunk_hi = masked_bin_inds[chunk_end]
                 chunk_frequencies = masked_frequency_array[chunk_lo:chunk_hi]
-                chunk_strain = masked_strain[chunk_lo:chunk_hi]
-                chunk_psd = masked_psd[chunk_lo:chunk_hi]
+                if is_contiguous:
+                    chunk_strain = raw_strain[
+                        raw_offset + chunk_lo:raw_offset + chunk_hi]
+                else:
+                    chunk_strain = raw_strain[in_band_indices[chunk_lo:chunk_hi]]
+                chunk_psd = (
+                    psd_model.get_power_spectral_density_array(chunk_frequencies)
+                    * window_power_correction)
                 chunk_h0 = {
                     f'{ell},{emm}': self._project_fiducial_mode(
                         interferometer, self._fiducial_converted_parameters,
