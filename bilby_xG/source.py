@@ -1169,6 +1169,42 @@ def binary_black_hole_individual_modes_frequency_sequence(
         phi_12=phi_12, lambda_1=0.0, lambda_2=0.0, **waveform_kwargs)
 
 
+def binary_neutron_star_individual_modes_frequency_sequence(
+        frequency_array, mass_1, mass_2, luminosity_distance, a_1, tilt_1,
+        phi_12, a_2, tilt_2, phi_jl, lambda_1, lambda_2, theta_jn, phase,
+        **kwargs):
+    """Tidal counterpart of :func:`binary_black_hole_individual_modes_
+    frequency_sequence`: a BNS waveform evaluated only at specified
+    frequency points, with strain values for individual modes (see that
+    function's docstring for the shared ``kwargs``, in particular
+    ``frequencies`` and ``mode_array``). Needed for the same reason
+    :func:`binary_neutron_star_frequency_sequence` exists alongside
+    :func:`binary_black_hole_individual_modes_frequency_sequence` -- the
+    latter hardcodes ``lambda_1=lambda_2=0.0`` and passes any ``lambda_1``/
+    ``lambda_2`` a caller supplies straight through into ``**kwargs``, which
+    collides with that hardcoded value and raises ``TypeError: ... multiple
+    values for keyword argument 'lambda_1'`` -- rather than silently
+    dropping tides, it simply cannot be used for a BNS mode-by-mode chunked/
+    frequency-sequence evaluation (e.g. a chunked injection or relative-
+    binning fiducial waveform) at all.
+
+    Returns
+    =======
+    dict: A dictionary with the plus and cross polarisation strain modes for
+    individual azimuthal modes present in the mode array
+    """
+    waveform_kwargs = dict(
+        waveform_approximant='IMRPhenomPv2_NRTidal', reference_frequency=50.0,
+        catch_waveform_errors=False, pn_spin_order=-1, pn_tidal_order=-1,
+        pn_phase_order=-1, pn_amplitude_order=0)
+    waveform_kwargs.update(kwargs)
+    return _base_waveform_individual_modes_frequency_sequence(
+        frequency_array=frequency_array, mass_1=mass_1, mass_2=mass_2,
+        luminosity_distance=luminosity_distance, theta_jn=theta_jn, phase=phase,
+        a_1=a_1, a_2=a_2, tilt_1=tilt_1, tilt_2=tilt_2, phi_jl=phi_jl,
+        phi_12=phi_12, lambda_1=lambda_1, lambda_2=lambda_2, **waveform_kwargs)
+
+
 def binary_neutron_star_frequency_sequence(
         frequency_array, mass_1, mass_2, luminosity_distance, a_1, tilt_1,
         phi_12, a_2, tilt_2, phi_jl, lambda_1, lambda_2, theta_jn, phase,

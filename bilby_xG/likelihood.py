@@ -1044,26 +1044,50 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         return r0, r1
 
     def _compute_full_waveform(self, signal_polarizations, interferometer):
+        """Reconstruct the full-resolution waveform ratio (only needed for
+        time marginalisation's FFT, ``calculate_snrs``).
+
+        Everything but the final scatter back to full band is done over
+        ``interferometer.frequency_mask`` (the in-band subset) rather than
+        the raw ``interferometer.frequency_array`` -- mirrors
+        :meth:`compute_summary_data`'s ``masked_bin_inds`` remap, needed so
+        ``self.bin_inds`` (built from the full-band array in
+        :meth:`setup_bins`) isn't used to index a differently-sized array.
+        The FFT downstream still needs a full-band, zero-outside-band array
+        aligned with ``interferometer.frequency_domain_strain`` /
+        ``power_spectral_density_array``, so that scatter still happens --
+        this only avoids holding ``2 + 3 * len(mode_array)`` full-band
+        buffers (a real cost once ``minimum_frequency`` is high enough that
+        the masked band is meaningfully smaller than the full one; at a low
+        ``minimum_frequency`` relative to ``maximum_frequency`` the two are
+        close in size and the saving is small, but this is still the
+        correct thing to index against).
+        """
         r0, r1 = self.compute_waveform_ratio_per_interferometer(signal_polarizations, interferometer)
         f = interferometer.frequency_array
-        full_waveform_ratio = np.zeros_like(f, dtype=complex)
-        full_waveform = np.zeros_like(f, dtype=complex)
+        mask = interferometer.frequency_mask
+        f_masked = f[mask]
+        masked_bin_inds = np.searchsorted(f_masked, self.bin_freqs)
+        full_waveform_ratio = np.zeros_like(f_masked, dtype=complex)
+        full_waveform_masked = np.zeros_like(f_masked, dtype=complex)
 
         for ell, emm in self.mode_array:
             mode_key = f"{ell},{emm}"
-            duplicated_r0, duplicated_r1, duplicated_fm = np.zeros((3, f.shape[0]), dtype=complex)
+            duplicated_r0, duplicated_r1, duplicated_fm = np.zeros((3, f_masked.shape[0]), dtype=complex)
 
             for i in range(self.number_of_bins):
-                idxs = slice(self.bin_inds[i], self.bin_inds[i + 1])
+                idxs = slice(masked_bin_inds[i], masked_bin_inds[i + 1])
                 duplicated_fm[idxs] = self.bin_centers[i]
                 duplicated_r0[idxs] = r0[mode_key][i]
                 duplicated_r1[idxs] = r1[mode_key][i]
 
-            full_waveform_ratio += duplicated_r0 + duplicated_r1 * (f - duplicated_fm)
+            full_waveform_ratio += duplicated_r0 + duplicated_r1 * (f_masked - duplicated_fm)
             fiducial_waveform = self._project_fiducial_mode(
-                interferometer, self._fiducial_converted_parameters, mode_key, f)
-            full_waveform += full_waveform_ratio * fiducial_waveform
+                interferometer, self._fiducial_converted_parameters, mode_key, f_masked)
+            full_waveform_masked += full_waveform_ratio * fiducial_waveform
 
+        full_waveform = np.zeros_like(f, dtype=complex)
+        full_waveform[mask] = full_waveform_masked
         return full_waveform
 
     def calculate_snrs(self, waveform_polarizations, interferometer, return_array=True, parameters=None):
