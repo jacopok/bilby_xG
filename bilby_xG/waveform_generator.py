@@ -27,6 +27,31 @@ __author__ = ["Pratyusava Baral <pbaral@uwm.edu>", "Soichiro Morisaki"]
 
 
 class WaveformGenerator(_WaveformGenerator):
+    def __getstate__(self):
+        """Don't pickle the full-band frequency/time arrays.
+
+        Both are pure functions of ``duration``/``sampling_frequency``/
+        ``start_time`` (unlike, say, an interferometer's actual strain data)
+        -- ``bilby.core.series.CoupledTimeAndFrequencySeries`` regenerates
+        either lazily and cheaply (one ``create_frequency_series``/
+        ``create_time_series`` call, no LAL/model evaluation involved) the
+        next time it's accessed, so there's nothing to lose by dropping them
+        before pickling instead of embedding ~1-2GB of derived data that
+        this codebase's low-minimum_frequency runs would otherwise carry in
+        every ``.pickle`` on disk and every sampler worker-pool ``initargs``.
+        """
+        state = self.__dict__.copy()
+        taf = state.get("_times_and_frequencies")
+        if taf is not None:
+            slim_taf = taf.__class__.__new__(taf.__class__)
+            slim_taf.__dict__.update(taf.__dict__)
+            slim_taf.__dict__["_frequency_array"] = None
+            slim_taf.__dict__["_frequency_array_updated"] = False
+            slim_taf.__dict__["_time_array"] = None
+            slim_taf.__dict__["_time_array_updated"] = False
+            state["_times_and_frequencies"] = slim_taf
+        return state
+
     def frequency_domain_strain(self, parameters=None):
         transformed_model_data_points = (
             self.time_array if self.time_domain_source_model is not None else None)
