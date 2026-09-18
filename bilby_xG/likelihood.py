@@ -1347,6 +1347,18 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                     summary_data[interferometer.name]['b0'][keyp][key] = np.conj(b0[key][keyp])
                     summary_data[interferometer.name]['b1'][keyp][key] = np.conj(b1[key][keyp])
 
+            # Free this detector's full-band frequency array/mask/PSD cache
+            # (repopulated above by the frequency_mask/frequency_array
+            # accesses) before moving to the next interferometer -- without
+            # this they stay attached to `interferometer` (and so to
+            # self.interferometers, held for the likelihood's lifetime) and
+            # accumulate across detectors instead of each one's being
+            # released once its summary data is done.
+            interferometer.discard_regenerable_frequency_caches()
+            del mask, masked_frequency_array, masked_bin_inds, raw_strain
+            if in_band_indices is not None:
+                del in_band_indices
+
         self.summary_data = summary_data
 
     def compute_waveform_ratio_per_interferometer(self, waveform_polarizations, interferometer):
