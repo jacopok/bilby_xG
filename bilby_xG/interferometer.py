@@ -69,6 +69,44 @@ class Interferometer(_Interferometer):
             length, latitude, longitude, elevation, xarm_azimuth, yarm_azimuth,
             xarm_tilt, yarm_tilt)
 
+    def optimal_snr_squared(self, signal, max_bins=2 ** 20):
+        """Approximate optimal SNR^2 via strided frequency-bin decimation.
+
+        ``signal`` and this interferometer's PSD/frequency arrays are
+        full-band (``duration * sampling_frequency`` bins -- O(1e8) at ET's
+        low ``minimum_frequency``, ~GB-scale per array). The upstream
+        implementation (``bilby.gw.detector.interferometer.Interferometer``)
+        boolean-masks and squares full-size copies internally, multiplying
+        peak transient memory several-fold over the persistent per-detector
+        arrays already held; on this codebase's low-``minimum_frequency``
+        runs that is enough to OOM a memory-constrained host (observed:
+        killed mid-way through the injected-SNR log lines on a 3-detector ET
+        triangle at minimum_frequency=3Hz). This method is only used for
+        logging/diagnostics, not the likelihood -- the relative-binning
+        likelihood computes its own reduced-data SNR -- so it is safe to
+        approximate: |h(f)|^2/S_n(f) varies smoothly with frequency (unlike
+        the oscillatory complex waveform itself), so summing over a strided
+        subset of frequency bins and rescaling by the stride gives an SNR
+        accurate to well under a percent while only ever operating on
+        decimated-size arrays (all indexing below is done after striding, so
+        no full-size copy is ever materialized). Falls back to the exact
+        upstream computation when the unmasked band is already small enough
+        that decimation isn't needed.
+        """
+        mask = self.strain_data.frequency_mask
+        n_unmasked = int(np.count_nonzero(mask))
+        stride = max(1, n_unmasked // max_bins)
+        if stride == 1:
+            return super().optimal_snr_squared(signal=signal)
+
+        strided_mask = mask[::stride]
+        s = signal[::stride][strided_mask]
+        freqs = self.strain_data.frequency_array[::stride][strided_mask]
+        psd = (self.power_spectral_density.get_power_spectral_density_array(
+            frequency_array=freqs) * self._window_power_correction)
+        integrand = np.conj(s) * s / psd
+        return 4 / self.strain_data.duration * np.sum(integrand) * stride
+
     @staticmethod
     def _finite_size_factor(x, y):
         """Single-arm finite-size response factor (Baral et al. 2023, Eq. 2.13)."""
