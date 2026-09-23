@@ -28,6 +28,7 @@ Provides:
   optionally, that paper's adaptive bin-selection algorithm.
 """
 import tempfile
+import time
 
 import numpy as np
 from scipy.optimize import differential_evolution
@@ -800,6 +801,20 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             f"[{minimum_frequency:.3g}, {maximum_frequency:.3g}] Hz "
             f"({selection_description}).")
 
+        self.waveform_generator.waveform_arguments["frequency_bin_edges"] = self.bin_freqs
+        self.bin_widths = self.bin_freqs[1:] - self.bin_freqs[:-1]
+        self.bin_centers = (self.bin_freqs[1:] + self.bin_freqs[:-1]) / 2
+
+        for interferometer in self.interferometers:
+            name = interferometer.name
+            self.per_detector_per_mode_fiducial_waveform_points[name] = {}
+            for mode in self.mode_array:
+                mode_key = f"{mode[0]},{mode[1]}"
+                self.per_detector_per_mode_fiducial_waveform_points[name][mode_key] = \
+                    self._project_fiducial_mode(
+                        interferometer, self._fiducial_converted_parameters,
+                        mode_key, self.bin_freqs)
+
     def mode_by_mode_bin_freqs(self, test_parameters, frequency_array,
                                 minimum_frequency, maximum_frequency):
         """Adaptive frequency bin edges for mode-by-mode relative binning.
@@ -847,6 +862,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         iterations = 0
         while previous_number_of_bins != target_number_of_bins and iterations < 50:
             target_bin_error = eta / target_number_of_bins
+            self._bisect_bin_search_calls = 0
+            self._bisect_bin_search_last_log = time.time()
             indices = self._bisect_bin_search(
                 test_converted_parameters, ref_freqs, 0, len(ref_freqs) - 1, target_bin_error)
             previous_number_of_bins = target_number_of_bins
@@ -871,6 +888,15 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             return [lo, hi]
         error = self._log_likelihood_error_for_candidate_bin(
             test_converted_parameters, ref_freqs[lo], ref_freqs[hi])
+        self._bisect_bin_search_calls += 1
+        now = time.time()
+        if now - self._bisect_bin_search_last_log > 5:
+            self._bisect_bin_search_last_log = now
+            logger.info(
+                f"Mode-by-mode bin selection: {self._bisect_bin_search_calls} "
+                f"candidate bins evaluated so far, current candidate "
+                f"[{ref_freqs[lo]:.3g}, {ref_freqs[hi]:.3g}] Hz, error={error:.3g} "
+                f"(target {target_bin_error:.3g}).")
         if error <= target_bin_error:
             return [lo, hi]
         mid = (lo + hi) // 2
@@ -992,20 +1018,6 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         exact_ll = np.real(exact_dh) - 0.5 * np.real(exact_hh)
         approx_ll = np.real(approx_dh) - 0.5 * np.real(approx_hh)
         return exact_ll, approx_ll
-
-        self.waveform_generator.waveform_arguments["frequency_bin_edges"] = self.bin_freqs
-        self.bin_widths = self.bin_freqs[1:] - self.bin_freqs[:-1]
-        self.bin_centers = (self.bin_freqs[1:] + self.bin_freqs[:-1]) / 2
-
-        for interferometer in self.interferometers:
-            name = interferometer.name
-            self.per_detector_per_mode_fiducial_waveform_points[name] = {}
-            for mode in self.mode_array:
-                mode_key = f"{mode[0]},{mode[1]}"
-                self.per_detector_per_mode_fiducial_waveform_points[name][mode_key] = \
-                    self._project_fiducial_mode(
-                        interferometer, self._fiducial_converted_parameters,
-                        mode_key, self.bin_freqs)
 
     def set_fiducial_waveforms(self, parameters):
         """Set fiducial waveforms based on the given parameters.
