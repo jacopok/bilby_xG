@@ -11,6 +11,8 @@ frequency-dependent antenna response can be applied mode-by-mode:
 * :func:`lal_binary_black_hole_individual_modes`
 * :func:`lal_binary_black_hole_relative_binning_individual_modes`
 * :func:`binary_black_hole_individual_modes_frequency_sequence`
+* :func:`mlgw_bns_individual_modes` (with :func:`convert_to_mlgw_bns_parameters`;
+  needs the optional ``mlgw-bns`` package)
 
 The module owns its own non-destructive ``_base_lal_cbc_fd_waveform`` helper, so
 it is independent of upstream bilby's waveform-kwargs handling.
@@ -1497,7 +1499,9 @@ def _base_waveform_individual_modes_frequency_sequence(
     mode_array = waveform_kwargs['mode_array']
 
     return_dict = {}
-    for m_ in [2, 3, 4]:
+    # one LAL call per |m| group: every mode in a group shares the same
+    # time-to-merger (and so antenna-pattern) treatment
+    for m_ in sorted({abs(int(mode[-1])) for mode in mode_array}):
         mode_array_lal = lalsim.SimInspiralCreateModeArray()
         for mode in mode_array:
             if np.abs(mode[-1]) == m_:
@@ -1727,3 +1731,112 @@ PARAMETER_SETS = dict(
     sky=sky, distance_inclination=distance_inclination,
     measured_spin=measured_spin,
 )
+
+
+# ---------------------------------------------------------------------------
+# mlgw_bns (optional dependency: ``pip install mlgw-bns``)
+# ---------------------------------------------------------------------------
+
+#: Modes of the pretrained mlgw_bns ``default_hom`` model.
+MLGW_BNS_MODES = [(2, 2), (2, 1), (3, 3), (4, 4)]
+
+_MLGW_BNS_MODEL = None
+
+
+def _mlgw_bns_model():
+    """The pretrained mlgw_bns surrogate, loaded once per process.
+
+    Its stored parameter ranges reject lambda < 5 (a guard for TEOBResumS
+    during training); the surrogate itself is fine down to 0, which a flat
+    tidal prior reaches, so that bound is relaxed.
+    """
+    global _MLGW_BNS_MODEL
+    if _MLGW_BNS_MODEL is None:
+        from mlgw_bns.model import Model
+
+        model = Model.default_for_testing()
+        model.dataset.parameter_ranges.lambda1_range = (0.0, 5000.0)
+        model.dataset.parameter_ranges.lambda2_range = (0.0, 5000.0)
+        _MLGW_BNS_MODEL = model
+    return _MLGW_BNS_MODEL
+
+
+def convert_to_mlgw_bns_parameters(parameters):
+    """``parameter_conversion`` for :func:`mlgw_bns_individual_modes`: bilby
+    ``chirp_mass``/``mass_ratio``/``chi_1``/``chi_2``/``lambda_1``/``lambda_2``
+    ... to the (TEOBResumS-convention) arguments of the source model."""
+    q = parameters["mass_ratio"]
+    total_mass = parameters["chirp_mass"] / (q / (1 + q) ** 2) ** (3 / 5)
+    mass_1 = total_mass / (1 + q)
+    added = dict(
+        M=total_mass, q=q, mass_1=mass_1,
+        mass_2=np.clip(total_mass * q / (1 + q), 0, mass_1),
+        chi1z=parameters["chi_1"], chi2z=parameters["chi_2"],
+        LambdaAl2=parameters["lambda_1"], LambdaBl2=parameters["lambda_2"],
+        distance=parameters["luminosity_distance"],
+        inclination=parameters["theta_jn"],
+        coalescence_angle=parameters["phase"],
+    )
+    return added | parameters, list(added)
+
+
+def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
+                              LambdaBl2, distance, inclination,
+                              coalescence_angle, **kwargs):
+    """Aligned-spin tidal BNS from the mlgw_bns surrogate of TEOBResumS, as
+    per-mode plus/cross polarisations ``{"l,m": {"plus", "cross"}}``.
+
+    Use with :func:`convert_to_mlgw_bns_parameters`. Evaluated on the
+    ``frequency_bin_edges`` waveform argument when given (so it serves both the
+    full-grid and the relative-binning likelihoods, and chunked injections),
+    otherwise on ``frequency_array``. ``mode_array`` selects a subset of
+    :data:`MLGW_BNS_MODES`.
+    """
+    from mlgw_bns import ParametersWithExtrinsic
+    from mlgw_bns.higher_order_modes import Mode
+    from mlgw_bns.model import _build_mode_coeffs
+
+    freqs = np.asarray(kwargs.get("frequency_bin_edges", frequency_array), dtype=float)
+    requested = [(int(ell), int(emm)) for ell, emm in kwargs.get("mode_array", MLGW_BNS_MODES)]
+    unknown = [mode for mode in requested if mode not in MLGW_BNS_MODES]
+    if unknown:
+        raise ValueError(f"mlgw_bns does not provide the modes {unknown}; "
+                         f"available: {MLGW_BNS_MODES}")
+
+    model = _mlgw_bns_model()
+    modes = model.modes
+    params = ParametersWithExtrinsic(
+        mass_ratio=1.0 / q if q <= 1.0 else q,  # mlgw_bns: q = m1 / m2 >= 1
+        lambda_1=LambdaAl2, lambda_2=LambdaBl2, chi_1=chi1z, chi_2=chi2z,
+        distance_mpc=distance, inclination=inclination, total_mass=M,
+        reference_phase=0.0, time_shift=0.0)
+
+    positive = freqs > 0.0
+    f_pos = freqs[positive]
+    # pi/2 - phase: the azimuth convention of the TEOBResumS SPA models
+    ylm = model._compute_Ylm_modes(
+        modes=modes, phi=np.pi / 2.0 - coalescence_angle, iota=inclination)
+    time_shifts = np.broadcast_to(
+        np.asarray(model._resolve_time_shifts(params, None), dtype=float),
+        (len(modes),))
+    mass_rescaling = params.total_mass / model.dataset.total_mass
+    eta = params.intrinsic(model.dataset).eta
+
+    out = {}
+    for ell, emm in requested:
+        idx = modes.index(Mode(ell, emm))
+        plus = np.zeros_like(freqs, dtype=complex)
+        cross = np.zeros_like(freqs, dtype=complex)
+        if f_pos.size:
+            amp, phase = model.mode_models[modes[idx]].predict_amplitude_phase_optimized(
+                f_pos, params)
+            phase = phase + 2.0 * np.pi * f_pos * (time_shifts[idx] * mass_rescaling)
+            c = _build_mode_coeffs(modes, [idx], *ylm)[0]
+            cos, sin = np.cos(phase), np.sin(phase)
+            # same normalisation as mlgw_bns' Model.predict_modes_dict
+            plus[positive] = amp * ((cos * c[0] + sin * c[1])
+                                    + 1j * (cos * c[2] + sin * c[3])) / eta / 2.0
+            cross[positive] = amp * ((cos * c[4] + sin * c[5])
+                                     + 1j * (cos * c[6] + sin * c[7])) / eta / 2.0
+        out[f"{ell},{emm}"] = {"plus": plus, "cross": cross}
+    return out
