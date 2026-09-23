@@ -620,6 +620,12 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         ``bin_selection_eta / target_number_of_bins`` before the algorithm's
         outer loop converges on the actual number of bins needed. Default
         200, as in the paper.
+    bin_freqs: array_like, optional
+        Precomputed bin-edge frequencies, e.g. from
+        :func:`bilby_xG.bin_selection.select_relative_binning_bins`. They are
+        snapped to the data's frequency grid and clipped to the band, whose
+        edges are always included. Takes precedence over
+        ``bin_selection_test_parameters`` and ``chi``/``epsilon``.
 
     Returns
     -------
@@ -652,6 +658,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                  bin_selection_test_parameters=None,
                  bin_selection_eta=0.1,
                  bin_selection_target_number_of_bins=200,
+                 bin_freqs=None,
                  earth_rotation_time_delay=True,
                  earth_rotation_beam_patterns=True,
                  finite_size=True,
@@ -692,6 +699,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         self.bin_selection_test_parameters = bin_selection_test_parameters
         self.bin_selection_eta = bin_selection_eta
         self.bin_selection_target_number_of_bins = bin_selection_target_number_of_bins
+        self.precomputed_bin_freqs = None if bin_freqs is None else np.asarray(bin_freqs)
         self.maximum_frequency = waveform_generator.frequency_array[-1]
         self.fiducial_waveform_obtained = False
         self.check_if_bins_are_setup = False
@@ -776,7 +784,27 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             [ifo.maximum_frequency for ifo in self.interferometers], initial=frequency_array[-1])
         maximum_frequency = min(maximum_frequency, self.maximum_frequency)
 
-        if self.bin_selection_test_parameters is not None:
+        if self.precomputed_bin_freqs is not None:
+            ref_freqs = frequency_array[
+                (frequency_array >= minimum_frequency) & (frequency_array <= maximum_frequency)]
+            inner = self.precomputed_bin_freqs[
+                (self.precomputed_bin_freqs > ref_freqs[0])
+                & (self.precomputed_bin_freqs < ref_freqs[-1])]
+            indices = np.unique(np.concatenate(
+                [[0], np.searchsorted(ref_freqs, inner), [len(ref_freqs) - 1]]))
+            # an inner edge right at the band's end (the given edges may end
+            # slightly below this likelihood's maximum frequency) would leave
+            # a sliver bin: merge it into its neighbour
+            if len(indices) > 2 and ref_freqs[indices[-1]] - ref_freqs[indices[-2]] < 0.01 * (
+                    ref_freqs[indices[-2]] - ref_freqs[indices[-3]]):
+                indices = np.delete(indices, -2)
+            if len(indices) > 2 and ref_freqs[indices[1]] - ref_freqs[indices[0]] < 0.01 * (
+                    ref_freqs[indices[2]] - ref_freqs[indices[1]]):
+                indices = np.delete(indices, 1)
+            bin_freqs = ref_freqs[indices]
+            selection_description = (
+                f"precomputed, {len(self.precomputed_bin_freqs) - 1} bins given")
+        elif self.bin_selection_test_parameters is not None:
             bin_freqs = self.mode_by_mode_bin_freqs(
                 self.bin_selection_test_parameters, frequency_array,
                 minimum_frequency, maximum_frequency)
