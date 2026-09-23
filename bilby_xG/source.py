@@ -13,6 +13,8 @@ frequency-dependent antenna response can be applied mode-by-mode:
 * :func:`binary_black_hole_individual_modes_frequency_sequence`
 * :func:`mlgw_bns_individual_modes` (with :func:`convert_to_mlgw_bns_parameters`;
   needs the optional ``mlgw-bns`` package)
+* :func:`teobresums_spa_individual_modes` (with
+  :func:`convert_to_teobresums_parameters`; needs TEOBResumS' ``EOBRun_module``)
 
 The module owns its own non-destructive ``_base_lal_cbc_fd_waveform`` helper, so
 it is independent of upstream bilby's waveform-kwargs handling.
@@ -1839,4 +1841,137 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
             cross[positive] = amp * ((cos * c[4] + sin * c[5])
                                      + 1j * (cos * c[6] + sin * c[7])) / eta / 2.0
         out[f"{ell},{emm}"] = {"plus": plus, "cross": cross}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# TEOBResumS SPA (optional dependency: the ``EOBRun_module`` extension built
+# from https://bitbucket.org/teobresums/teobresums, ``Python/`` directory)
+# ---------------------------------------------------------------------------
+
+#: TEOBResumS amplitude unit, Mpc / Msun**2 / Hz.
+TEOBRESUMS_AMP_SI_BASE = 4.2425873413901263e24
+
+#: Start the EOB dynamics this factor below the frequency strictly needed for
+#: the highest-m mode to cover ``minimum_frequency``.
+TEOBRESUMS_F_START_SAFETY_FACTOR = 1.1
+
+
+def _wigner_d(ell, emm, s, iota):
+    """Wigner d-function d^l_{m,s}(iota), eq. (II.8) of arXiv:0709.0093."""
+    from math import cos, factorial, sin, sqrt
+
+    c, s_ = cos(iota / 2), sin(iota / 2)
+    norm = sqrt(factorial(ell + emm) * factorial(ell - emm)
+                * factorial(ell + s) * factorial(ell - s))
+    out = 0.0
+    for k in range(max(0, emm - s), min(ell + emm, ell - s) + 1):
+        out += ((-1) ** k * c ** (2 * ell + emm - s - 2 * k) * s_ ** (2 * k + s - emm)
+                / (factorial(k) * factorial(ell + emm - k)
+                   * factorial(ell - s - k) * factorial(s - emm + k)))
+    return norm * out
+
+
+def _spin_weighted_ylm(s, ell, emm, phi, iota):
+    """Real and imaginary parts of the spin-weighted harmonic sY_lm(iota, phi)."""
+    if ell < 0 or not -ell <= emm <= ell:
+        raise ValueError("Invalid (l, m)")
+    d = (-1.0) ** (-s) * np.sqrt((2 * ell + 1) / (4 * np.pi)) * _wigner_d(ell, emm, -s, iota)
+    return np.cos(emm * phi) * d, np.sin(emm * phi) * d
+
+
+def _teobresums_mode_polarizations(amp, phi, ell, emm, reference_phase, iota):
+    """Plus/cross of one (l, +-m) pair from the TEOBResumS amplitude and
+    phase, following the TEOBResumS C code (H_{l-m} = (-)^l H*_{lm})."""
+    yr, yi = _spin_weighted_ylm(-2, ell, emm, reference_phase, iota)
+    yrn, yin = _spin_weighted_ylm(-2, ell, -emm, reference_phase, iota)
+    cos, sin = np.cos(phi), np.sin(phi)
+    cospm, sinpm = np.cos(phi + np.pi / 2), np.sin(phi + np.pi / 2)
+    sign = -1 if ell % 2 else 1
+    pr = amp * (cos * (yr + sign * yrn) - sin * (yi - sign * yin))
+    pi = amp * (cos * (yi - sign * yin) + sin * (yr + sign * yrn))
+    cr = amp * (cospm * (yr - sign * yrn) - sinpm * (yi + sign * yin))
+    ci = amp * (cospm * (yi + sign * yin) + sinpm * (yr - sign * yrn))
+    overall = 1 if emm % 2 == 0 else -1
+    return overall * (pr - 1j * pi), overall * (cr - 1j * ci)
+
+
+def convert_to_teobresums_parameters(parameters):
+    """``parameter_conversion`` for :func:`teobresums_spa_individual_modes`
+    (bilby ``chirp_mass``/``mass_ratio``/... to TEOBResumS arguments; also
+    forwards eccentricity and in-plane spins when present)."""
+    q = parameters["mass_ratio"]
+    total_mass = parameters["chirp_mass"] / (q / (1 + q) ** 2) ** (3 / 5)
+    mass_1 = total_mass / (1 + q)
+    added = {
+        "M": total_mass, "q": q, "mass_1": mass_1,
+        "mass_2": np.clip(total_mass * q / (1 + q), 0, mass_1),
+        "chi1": parameters["chi_1"], "chi2": parameters["chi_2"],
+        "chi1z": parameters["chi_1"], "chi2z": parameters["chi_2"],
+        "LambdaAl2": parameters["lambda_1"], "LambdaBl2": parameters["lambda_2"],
+        "distance": parameters["luminosity_distance"],
+        "inclination": parameters["theta_jn"],
+        "coalescence_angle": parameters["phase"],
+    }
+    if parameters.get("eccentricity", 0.0) != 0:
+        added["ecc"] = parameters["eccentricity"]
+    for bilby_key, teob_key in [("s1x", "chi1x"), ("s1y", "chi1y"),
+                                ("s2x", "chi2x"), ("s2y", "chi2y")]:
+        if parameters.get(bilby_key, 0.0) != 0:
+            added[teob_key] = parameters[bilby_key]
+    in_plane = ["chi1x", "chi1y", "chi2x", "chi2y"]
+    if all(key in added for key in in_plane) and sum(added[k] ** 2 for k in in_plane) > 1e-7:
+        added["use_spins"] = 2
+    return added | parameters, list(added)
+
+
+def teobresums_spa_individual_modes(frequency_array, M, q, chi1z, chi2z,
+                                    LambdaAl2, LambdaBl2, distance, inclination,
+                                    coalescence_angle, **kwargs):
+    """Aligned-spin tidal TEOBResumS in its stationary-phase (SPA) frequency
+    domain version, as per-mode plus/cross ``{"l,m": {"plus", "cross"}}``.
+
+    Use with :func:`convert_to_teobresums_parameters`. Evaluated on the
+    ``frequency_bin_edges`` waveform argument when given, otherwise on
+    ``frequency_array``. Each call integrates the EOB dynamics from just below
+    ``minimum_frequency``, so evaluating on many small chunks is expensive.
+    """
+    import EOBRun_module
+
+    freqs = kwargs.get("frequency_bin_edges", frequency_array)
+    freqs = np.asarray(freqs).tolist()
+    waveform_kwargs = dict(
+        reference_frequency=20.0, minimum_frequency=20.0,
+        maximum_frequency=freqs[-1], mode_array=[[2, 2], [3, 2], [3, 3], [4, 4]])
+    waveform_kwargs.update(kwargs)
+    mode_array = waveform_kwargs["mode_array"]
+    use_mode_lm = [int(ell * (ell - 1) / 2 + emm - 2) for ell, emm in mode_array]
+    # Mode (l, m) starts at (m / 2) x the initial (2,2) frequency, so the
+    # highest m decides where the dynamics must start.
+    max_m = max(emm for _, emm in mode_array)
+    initial_frequency = (2 * waveform_kwargs["minimum_frequency"] / max_m
+                         / TEOBRESUMS_F_START_SAFETY_FACTOR)
+    srate = waveform_kwargs["maximum_frequency"] * 2
+    f, _, _, _, _, hflm, _, dyn = EOBRun_module.EOBRunPy({
+        "M": M, "q": q, "chi1": chi1z, "chi2": chi2z, "chi1z": chi1z,
+        "chi2z": chi2z, "LambdaAl2": LambdaAl2, "LambdaBl2": LambdaBl2,
+        "distance": distance, "inclination": inclination,
+        "coalescence_angle": coalescence_angle, "srate": srate,
+        "srate_interp": srate, "use_geometric_units": "no",
+        "output_hpc": "no", "output_lm": use_mode_lm,
+        "output_multipoles": "no", "use_mode_lm": use_mode_lm, "domain": 1,
+        "interp_freqs": "yes", "freqs": freqs, "output_dir": "data",
+        "initial_frequency": initial_frequency,
+        "reference_frequency": waveform_kwargs["reference_frequency"],
+        "arg_out": "yes", "time_shift_FD": "yes"})
+
+    eta = q / (1 + q) ** 2
+    prefactor = M ** 2 * eta / distance / TEOBRESUMS_AMP_SI_BASE / 2.0
+    phasor = np.exp(2j * np.pi * dyn["tc"] * f) * prefactor
+    out = {}
+    for (ell, emm), k in zip(mode_array, use_mode_lm):
+        plus, cross = _teobresums_mode_polarizations(
+            hflm[str(k)][0], hflm[str(k)][1], ell, emm,
+            np.pi / 2.0 - coalescence_angle, inclination)
+        out[f"{ell},{emm}"] = {"plus": plus * phasor, "cross": cross * phasor}
     return out

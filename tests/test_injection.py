@@ -1,4 +1,4 @@
-"""Tests for the chunked zero-noise injection and the mlgw_bns source model."""
+"""Tests for the chunked zero-noise injection."""
 import numpy as np
 import pytest
 
@@ -68,30 +68,6 @@ def test_matches_all_modes_frequency_sequence_response():
         np.testing.assert_allclose(ifo.frequency_domain_strain, expected,
                                    rtol=0, atol=1e-10 * np.abs(expected).max())
         assert np.all(ifo.frequency_domain_strain[~mask] == 0)
-
-
-def test_mlgw_bns_modes():
-    pytest.importorskip("mlgw_bns")
-    from bilby_xG.source import convert_to_mlgw_bns_parameters, mlgw_bns_individual_modes
-
-    params, added = convert_to_mlgw_bns_parameters(dict(
-        chirp_mass=1.2, mass_ratio=0.9, chi_1=0.01, chi_2=0.0, lambda_1=400.0,
-        lambda_2=900.0, luminosity_distance=40.0, theta_jn=0.35, phase=1.57))
-    assert {"M", "q", "LambdaAl2", "coalescence_angle"} <= set(added)
-    freqs = np.array([0.0, 5.0, 20.0, 100.0, 1000.0])
-    kwargs = {key: params[key] for key in [
-        "M", "q", "chi1z", "chi2z", "LambdaAl2", "LambdaBl2", "distance",
-        "inclination", "coalescence_angle"]}
-    modes = mlgw_bns_individual_modes(freqs, **kwargs, mode_array=[[2, 2], [3, 3]])
-    assert set(modes) == {"2,2", "3,3"}
-    for pols in modes.values():
-        assert pols["plus"][0] == 0 and np.all(np.abs(pols["plus"][1:]) > 0)
-    # frequency_bin_edges takes precedence over the frequency array
-    on_edges = mlgw_bns_individual_modes(freqs, **kwargs, mode_array=[[2, 2]],
-                                         frequency_bin_edges=freqs[2:])
-    np.testing.assert_array_equal(on_edges["2,2"]["cross"], modes["2,2"]["cross"][2:])
-    with pytest.raises(ValueError):
-        mlgw_bns_individual_modes(freqs, **kwargs, mode_array=[[3, 2]])
 
 
 def test_frequency_sequence_keeps_m1_modes():

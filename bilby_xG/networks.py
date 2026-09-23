@@ -110,11 +110,13 @@ class TriangularInterferometer(_networks.TriangularInterferometer):
                     / utils.radius_of_earth) * 180 / np.pi
 
 
-def load_interferometer(filename):
+def load_interferometer(filename, **overrides):
     """Load a bilby_xG interferometer from a ``*.interferometer`` file.
 
     The file format is the same as bilby's; ``PowerSpectralDensity`` entries
     additionally resolve against the noise curves shipped with bilby_xG.
+    ``overrides`` replace or add constructor arguments, e.g.
+    ``colocated=True`` for a triangular detector.
     """
     parameters = dict()
     with open(filename, "r") as parameter_file:
@@ -128,6 +130,7 @@ def load_interferometer(filename):
                 {"PowerSpectralDensity": PowerSpectralDensity},
             )
             parameters[key] = value
+    parameters.update(overrides)
     shape = parameters.pop("shape", "L")
     if shape.lower() in ["l", "ligo"]:
         ifo = Interferometer(**parameters)
@@ -140,7 +143,7 @@ def load_interferometer(filename):
     return ifo
 
 
-def get_empty_interferometer(name):
+def get_empty_interferometer(name, **overrides):
     """Get a bilby_xG interferometer with standard parameters by name.
 
     Detector definitions shipped with bilby_xG (``CE``, ``CE20``, ``ET-EMR``,
@@ -152,6 +155,8 @@ def get_empty_interferometer(name):
     ==========
     name: str
         Interferometer identifier.
+    overrides:
+        Passed to :func:`load_interferometer`.
 
     Returns
     =======
@@ -164,7 +169,7 @@ def get_empty_interferometer(name):
             os.path.dirname(_networks.__file__), "detectors",
             "{}.interferometer".format(name))
     try:
-        return load_interferometer(filename)
+        return load_interferometer(filename, **overrides)
     except OSError:
         raise ValueError("Interferometer {} not implemented".format(name))
 

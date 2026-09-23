@@ -89,3 +89,34 @@ def calculate_time_to_merger_for_any_mode(frequency, mass_1, mass_2, chi_1=0,
     tau4 = 2. * (3058673. / 1016064. + 5429. * eta / 1008.
                  + 617. * eta ** 2. / 144. - sigma) * x ** (4. / 3.) * tau0
     return tau0 + tau2 + tau3 + tau4
+
+
+def read_frequency_domain_data_chunked(filename, frequency_array, cache_path,
+                                       chunksize=5_000_000):
+    """Read a frequency-domain data file written by
+    ``InterferometerList.save_data`` straight into a disk-backed ``.npy``
+    memmap at ``cache_path``.
+
+    Reading in chunks bounds peak memory to one chunk (a single
+    ``pandas.read_csv`` of a ~1e8-row file at a 3 Hz lower cutoff holds
+    several GB). With ``cache_path`` in the likelihood's ``array_cache_dir``
+    (``<ifo name>_frequency_domain_strain.npy``), the likelihood's own
+    offloading of the strain is then a no-op.
+
+    Returns the read-only memmap.
+    """
+    import pandas as pd
+
+    n_freq = len(frequency_array)
+    strain = np.lib.format.open_memmap(
+        cache_path, mode="w+", dtype=complex, shape=(n_freq,))
+    offset = 0
+    for chunk in pd.read_csv(filename, sep=" ", names=["f", "real", "imag"],
+                             skiprows=1, chunksize=chunksize):
+        n = len(chunk)
+        strain[offset:offset + n] = chunk["real"].to_numpy() + 1j * chunk["imag"].to_numpy()
+        offset += n
+    strain.flush()
+    if offset != n_freq:
+        raise ValueError(f"{filename}: read {offset} rows, expected {n_freq}")
+    return np.load(cache_path, mmap_mode="r")

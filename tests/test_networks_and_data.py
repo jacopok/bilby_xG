@@ -123,3 +123,33 @@ def test_log10_luminosity_distance_conversion():
         dict(mass_1=30.0, mass_2=30.0, log10_luminosity_distance=np.log10(400.0))
     )
     assert np.isclose(converted["luminosity_distance"], 400.0)
+
+
+def test_colocated_override_keeps_one_vertex():
+    import numpy as np
+    from bilby_xG.networks import InterferometerList, get_empty_interferometer
+
+    spread = InterferometerList(["ET-EMR"])
+    colocated = InterferometerList([get_empty_interferometer("ET-EMR", colocated=True)])
+    assert not np.allclose(spread[0].vertex, spread[1].vertex)
+    for ifo in colocated[1:]:
+        np.testing.assert_allclose(ifo.vertex, colocated[0].vertex)
+    for a, b in zip(spread, colocated):
+        np.testing.assert_allclose(a.detector_tensor, b.detector_tensor, atol=1e-2)
+
+
+def test_read_frequency_domain_data_chunked(tmp_path):
+    import numpy as np
+    from bilby_xG.networks import InterferometerList
+    from bilby_xG.utils import read_frequency_domain_data_chunked
+
+    ifos = InterferometerList(["ET-EMR"])
+    ifos.set_strain_data_from_power_spectral_densities(
+        sampling_frequency=256, duration=4, start_time=0)
+    ifos.save_data(str(tmp_path))
+    ifo = ifos[0]
+    strain = read_frequency_domain_data_chunked(
+        tmp_path / f"{ifo.name}_frequency_domain_data.dat", ifo.frequency_array,
+        tmp_path / "strain.npy", chunksize=37)
+    np.testing.assert_allclose(strain, ifo.frequency_domain_strain)
+    assert isinstance(strain, np.memmap)
