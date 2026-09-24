@@ -42,6 +42,8 @@ from bilby.gw.likelihood import (
 )
 from bilby.gw.utils import noise_weighted_inner_product
 
+from .injection import complex_gaussian
+
 __author__ = [
     "Pratyusava Baral <pbaral@uwm.edu>",
     "Soichiro Morisaki",
@@ -626,6 +628,11 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         snapped to the data's frequency grid and clipped to the band, whose
         edges are always included. Takes precedence over
         ``bin_selection_test_parameters`` and ``chi``/``epsilon``.
+    injection: bilby_xG.injection.SummaryDataInjection, optional
+        Simulated data: the summary data are built from this injection's
+        signal and a Gaussian-noise draw (or zero noise), and the
+        interferometers get the data grid but no strain. Without it the
+        summary data come from the interferometers' strain.
 
     Returns
     -------
@@ -663,7 +670,20 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                  earth_rotation_beam_patterns=True,
                  finite_size=True,
                  summary_data_chunk_size=2 ** 20,
-                 array_cache_dir=None):
+                 array_cache_dir=None,
+                 injection=None):
+
+        if injection is not None:
+            if time_marginalization:
+                raise ValueError(
+                    "time marginalization needs the full data, which an "
+                    "injection as summary data does not have")
+            if update_fiducial_parameters and injection.noise:
+                raise ValueError(
+                    "the noise realisation is drawn for fixed fiducial "
+                    "waveforms and bins, so they cannot be updated")
+            injection.setup_interferometers(interferometers)
+        self.injection = injection
 
         super(RelativeBinningGravitationalWaveTransientNextGenerationModebyMode, self).__init__(
             interferometers=interferometers,
@@ -710,12 +730,13 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         # Keeping this well below the full band means the full-resolution
         # fiducial waveform never has to be held in memory at once.
         self.summary_data_chunk_size = summary_data_chunk_size
-        if array_cache_dir is None:
+        if array_cache_dir is None and injection is None:
             array_cache_dir = tempfile.mkdtemp(prefix="bilby_xG_array_cache_")
         self.array_cache_dir = array_cache_dir
-        logger.info(
-            f"Disk-backed full-band array cache: {self.array_cache_dir} "
-            "(must remain until this likelihood is no longer used).")
+        if injection is None:
+            logger.info(
+                f"Disk-backed full-band array cache: {self.array_cache_dir} "
+                "(must remain until this likelihood is no longer used).")
         self._fiducial_converted_parameters = None
         # self.per_detector_fiducial_waveforms = dict()
         # self.per_detector_fiducial_waveform_points = dict()
@@ -977,7 +998,9 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             return None
 
         raw_offset = int(np.argmax(mask))
-        raw_strain = interferometer.strain_data._frequency_domain_strain
+        # an injection as summary data: the bins are chosen on its noiseless signal
+        raw_strain = (None if self.injection is not None
+                      else interferometer.strain_data._frequency_domain_strain)
         psd_model = interferometer.power_spectral_density
         window_power_correction = interferometer._window_power_correction
         duration = interferometer.duration
@@ -994,7 +1017,10 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         for chunk_lo in range(lo_idx, hi_idx, self.summary_data_chunk_size):
             chunk_hi = min(chunk_lo + self.summary_data_chunk_size, hi_idx)
             chunk_frequencies = masked_frequency_array[chunk_lo:chunk_hi]
-            chunk_strain = raw_strain[raw_offset + chunk_lo:raw_offset + chunk_hi]
+            if raw_strain is None:
+                chunk_strain = self.injection.signal(interferometer, chunk_frequencies)
+            else:
+                chunk_strain = raw_strain[raw_offset + chunk_lo:raw_offset + chunk_hi]
             chunk_psd = (
                 psd_model.get_power_spectral_density_array(chunk_frequencies)
                 * window_power_correction)
@@ -1277,11 +1303,21 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         cheap to regenerate from the PSD file, so it is simply recomputed at
         each chunk's (small) frequency sub-array instead of being cached at
         full band.
+
+        With ``self.injection`` (an injection as summary data) the strain is
+        instead the injected signal, evaluated per chunk, and each bin's
+        a0/a1 get a draw of their noise terms, sampled together with the
+        noise term of <s|d>, which gives :meth:`noise_log_likelihood`. See
+        :class:`bilby_xG.injection.SummaryDataInjection`.
         """
         summary_data = dict()
+        injection = self.injection
+        n_modes = len(self.mode_array)
+        network_s_inner_s, network_s_inner_n = 0.0, 0.0
 
         for interferometer in self.interferometers:
-            interferometer.offload_frequency_domain_strain(self.array_cache_dir)
+            if injection is None:
+                interferometer.offload_frequency_domain_strain(self.array_cache_dir)
             interferometer.discard_regenerable_frequency_caches()
             logger.info(
                 f"Computing summary data for {interferometer.name} "
@@ -1306,10 +1342,21 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             masked_frequency_array = interferometer.frequency_array[mask]
             masked_bin_inds = np.searchsorted(masked_frequency_array, self.bin_freqs)
             duration = interferometer.duration
-            raw_strain = interferometer.strain_data._frequency_domain_strain
+            raw_strain = (None if injection is not None
+                          else interferometer.strain_data._frequency_domain_strain)
             psd_model = interferometer.power_spectral_density
             window_power_correction = interferometer._window_power_correction
             a0, b0, a1, b1 = dict(), dict(), dict(), dict()
+            s_inner_s, s_inner_n = 0.0, 0j
+            if injection is not None and injection.noise:
+                # standard circular complex normals, one per basis function
+                # (h0_k, h0_k (f - f_m) for every mode k, and the signal) per
+                # bin, drawn up front so the realisation does not depend on
+                # the chunking
+                rng = injection.noise_generator(interferometer)
+                z = (rng.standard_normal((self.number_of_bins, 2 * n_modes + 1))
+                     + 1j * rng.standard_normal((self.number_of_bins, 2 * n_modes + 1))
+                     ) / np.sqrt(2)
 
             for j, (ell, emm) in enumerate(self.mode_array):
                 key = f'{ell},{emm}'
@@ -1325,7 +1372,9 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 chunk_lo = masked_bin_inds[chunk_start]
                 chunk_hi = masked_bin_inds[chunk_end]
                 chunk_frequencies = masked_frequency_array[chunk_lo:chunk_hi]
-                if is_contiguous:
+                if raw_strain is None:
+                    chunk_strain = injection.signal(interferometer, chunk_frequencies)
+                elif is_contiguous:
                     chunk_strain = raw_strain[
                         raw_offset + chunk_lo:raw_offset + chunk_hi]
                 else:
@@ -1370,6 +1419,32 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                             b0[key][keyp][i] = noise_weighted_inner_product(h0_p, h0, psd, duration)
                             b1[key][keyp][i] = noise_weighted_inner_product(h0_p, h0 * delta_frequency, psd, duration)
 
+                    if injection is None:
+                        continue
+                    s_inner_s += noise_weighted_inner_product(strain, strain, psd, duration).real
+                    if not injection.noise:
+                        continue
+                    h0s = np.array([chunk_h0[f'{ell},{emm}'][idxs]
+                                    for ell, emm in self.mode_array])
+                    basis = np.concatenate([h0s, h0s * delta_frequency, strain[None]])
+                    # gram[i, j] = <g_i | g_j>; the noise terms <g_i | n> have
+                    # E[x_i x_j^*] = 2 gram[i, j] for bilby's noise normalisation
+                    gram = 4 / duration * (basis.conj() / psd) @ basis.T
+                    noise = complex_gaussian(2 * gram, z[i])
+                    for j, (ell, emm) in enumerate(self.mode_array):
+                        a0[f'{ell},{emm}'][i] += noise[j]
+                        a1[f'{ell},{emm}'][i] += noise[n_modes + j]
+                    s_inner_n += noise[-1]
+
+            if injection is not None:
+                snr = np.sqrt(s_inner_s)
+                message = f"{interferometer.name}: injected optimal SNR {snr:.2f}"
+                if injection.noise:
+                    message += f", matched-filter SNR {(s_inner_s + s_inner_n.real) / snr:.2f}"
+                logger.info(message)
+                network_s_inner_s += s_inner_s
+                network_s_inner_n += s_inner_n.real
+
             for i, (ell, emm) in enumerate(self.mode_array):
                 key = f'{ell},{emm}'
                 summary_data[interferometer.name]['a0'][key] = a0[key]
@@ -1400,6 +1475,14 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 del in_band_indices
 
         self.summary_data = summary_data
+        if injection is not None:
+            snr = np.sqrt(network_s_inner_s)
+            message = f"Network injected optimal SNR {snr:.2f}"
+            if injection.noise:
+                message += f", matched-filter SNR {(network_s_inner_s + network_s_inner_n) / snr:.2f}"
+            logger.info(message)
+            # -<d|d>/2 without the parameter-independent -<n|n>/2
+            self._noise_log_likelihood_value = -network_s_inner_s / 2 - network_s_inner_n
 
     def compute_waveform_ratio_per_interferometer(self, waveform_polarizations, interferometer):
         name = interferometer.name

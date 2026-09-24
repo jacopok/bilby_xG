@@ -48,6 +48,7 @@ The package mirrors bilby's module layout:
 | `bilby_xG.networks` | `get_empty_interferometer`, `InterferometerList`, `TriangularInterferometer`, `PowerSpectralDensity` resolving the shipped `CE`/`CE20`/`ET` definitions and noise curves |
 | `bilby_xG.likelihood` | `GravitationalWaveTransientNextGeneration` and its multi-banded and relative-binning variants |
 | `bilby_xG.source` | CBC source models, including the individual-mode (higher-order-mode) models |
+| `bilby_xG.injection` | `SummaryDataInjection`: a signal in Gaussian or zero noise simulated directly as relative-binning summary data, with no full-band data array (pass it as `injection=` to the mode-by-mode relative-binning likelihood); `inject_zero_noise_chunked` for the full noiseless strain |
 | `bilby_xG.propagation` | `Propagation` (GR), `SpeedOfGravity`, `ModifiedDispersion`, `build_propagation` |
 | `bilby_xG.conversion` | CBC parameter conversions that also accept `log10_luminosity_distance` |
 | `bilby_xG.utils` | time-to-merger estimate and shipped-data lookup helpers |
