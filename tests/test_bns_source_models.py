@@ -29,6 +29,27 @@ def test_mlgw_bns_modes():
         mlgw_bns_individual_modes(freqs, **kwargs, mode_array=[[3, 2]])
 
 
+def test_mlgw_bns_modes_match_the_surrogate():
+    """Per mode, the model's own h_+ - i h_x (at azimuth 0, i.e. phase pi/2)."""
+    pytest.importorskip("mlgw_bns")
+    from mlgw_bns import ParametersWithExtrinsic
+    from bilby_xG.source import (_mlgw_bns_model, convert_to_mlgw_bns_parameters,
+                                 mlgw_bns_individual_modes)
+
+    params, _ = convert_to_mlgw_bns_parameters(dict(PARAMETERS, phase=np.pi / 2))
+    freqs = np.geomspace(3.0, 2048.0, 300)
+    modes = mlgw_bns_individual_modes(freqs, **{key: params[key] for key in SOURCE_KEYS})
+    expected = _mlgw_bns_model().predict_modes_dict(freqs, ParametersWithExtrinsic(
+        mass_ratio=1 / params["q"], lambda_1=params["LambdaAl2"],
+        lambda_2=params["LambdaBl2"], chi_1=params["chi1z"], chi_2=params["chi2z"],
+        distance_mpc=params["distance"], inclination=params["inclination"],
+        total_mass=params["M"], reference_phase=0.0, time_shift=0.0))
+    for key, pols in modes.items():
+        ell, emm = (int(part) for part in key.split(","))
+        np.testing.assert_allclose(pols["plus"] - 1j * pols["cross"], expected[(ell, emm)],
+                                   rtol=1e-12, atol=0)
+
+
 def test_teobresums_spa_modes():
     pytest.importorskip("EOBRun_module")
     from bilby_xG.source import (

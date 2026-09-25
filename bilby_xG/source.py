@@ -1794,6 +1794,7 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
     otherwise on ``frequency_array``. ``mode_array`` selects a subset of
     :data:`MLGW_BNS_MODES`.
     """
+    import sklearn
     from mlgw_bns import ParametersWithExtrinsic
     from mlgw_bns.higher_order_modes import Mode
     from mlgw_bns.model import _build_mode_coeffs
@@ -1818,10 +1819,15 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
     # pi/2 - phase: the azimuth convention of the TEOBResumS SPA models
     ylm = model._compute_Ylm_modes(
         modes=modes, phi=np.pi / 2.0 - coalescence_angle, iota=inclination)
-    time_shifts = np.broadcast_to(
-        np.asarray(model._resolve_time_shifts(params, None), dtype=float),
-        (len(modes),))
+    # scikit-learn's per-call input validation costs more than the one-row
+    # prediction it guards (mlgw_bns disables it the same way internally)
+    with sklearn.config_context(assume_finite=True, skip_parameter_validation=True):
+        time_shifts = np.broadcast_to(
+            np.asarray(model._resolve_time_shifts(params, None), dtype=float),
+            (len(modes),))
     mass_rescaling = params.total_mass / model.dataset.total_mass
+    # the anchor of the time-shift phase trend in Model._hpc_waveform_per_mode
+    reference_frequency = model.dataset.effective_initial_frequency_hz / mass_rescaling
     eta = params.intrinsic(model.dataset).eta
 
     out = {}
@@ -1830,9 +1836,12 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
         plus = np.zeros_like(freqs, dtype=complex)
         cross = np.zeros_like(freqs, dtype=complex)
         if f_pos.size:
+            # the time shift is applied here, once, as in
+            # Model._hpc_waveform_per_mode: not also inside the mode model
             amp, phase = model.mode_models[modes[idx]].predict_amplitude_phase_optimized(
-                f_pos, params)
-            phase = phase + 2.0 * np.pi * f_pos * (time_shifts[idx] * mass_rescaling)
+                f_pos, params, apply_time_shift=False)
+            phase = phase + 2.0 * np.pi * (f_pos - reference_frequency) * (
+                time_shifts[idx] * mass_rescaling)
             c = _build_mode_coeffs(modes, [idx], *ylm)[0]
             cos, sin = np.cos(phase), np.sin(phase)
             # same normalisation as mlgw_bns' Model.predict_modes_dict
