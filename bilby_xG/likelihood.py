@@ -27,6 +27,7 @@ Provides:
   bins chosen either by the closed-form arXiv:1806.08792 prescription or,
   optionally, that paper's adaptive bin-selection algorithm.
 """
+import inspect
 import tempfile
 import time
 
@@ -43,6 +44,30 @@ from bilby.gw.likelihood import (
 from bilby.gw.utils import noise_weighted_inner_product
 
 from .injection import complex_gaussian
+
+# bilby >= 2.8 passes ``parameters`` explicitly through log_likelihood_ratio
+# and calculate_snrs, and warns (FutureWarning) on every read of the
+# deprecated ``likelihood.parameters`` state. Older bilby only has the state.
+_PARAMETERS_AS_ARGUMENT = "parameters" in inspect.signature(
+    GravitationalWaveTransient.log_likelihood_ratio).parameters
+
+
+def _resolve_parameters(likelihood, parameters):
+    """Use the explicitly passed ``parameters``; fall back to the legacy
+    ``likelihood.parameters`` state only when none were given (bilby < 2.8
+    callers)."""
+    if parameters is None:
+        return likelihood.parameters
+    return parameters
+
+
+def _log_likelihood_ratio_at(likelihood, parameters):
+    """Evaluate ``likelihood.log_likelihood_ratio`` at ``parameters``
+    without touching the deprecated parameter state when bilby supports it."""
+    if _PARAMETERS_AS_ARGUMENT:
+        return likelihood.log_likelihood_ratio(parameters=dict(parameters))
+    likelihood.parameters.update(parameters)
+    return likelihood.log_likelihood_ratio()
 
 __author__ = [
     "Pratyusava Baral <pbaral@uwm.edu>",
@@ -183,8 +208,7 @@ class GravitationalWaveTransientNextGeneration(GravitationalWaveTransient):
                 waveform_polarizations_red[key]['cross'] = \
                     signal_polarizations[key]['cross'][idxs_above_minimum_frequency]
         h = np.zeros_like(frequencies, dtype=complex)
-        if parameters is None:
-            parameters = self.parameters
+        parameters = _resolve_parameters(self, parameters)
         parameters, _ = self.waveform_generator.parameter_conversion(parameters)
         h[idxs_above_minimum_frequency] = \
             interferometer.get_detector_response_for_frequency_dependent_antenna_response(
@@ -267,9 +291,8 @@ class MBGravitationalWaveTransientNextGeneration(MBGravitationalWaveTransient):
         =======
         snrs: named tuple of SNRs
         """
-        if parameters is not None:
-            self.parameters.update(parameters)
-        converted_parameters, _ = self.waveform_generator.parameter_conversion(self.parameters)
+        parameters = _resolve_parameters(self, parameters)
+        converted_parameters, _ = self.waveform_generator.parameter_conversion(parameters)
         waveform_polarizations_red = {}
         try:
             waveform_polarizations_red['plus'] = \
@@ -501,9 +524,10 @@ class RelativeBinningGravitationalWaveTransientNextGeneration(RelativeBinningGra
             wf[frequencies > self.maximum_frequency] = 0
             self.per_detector_fiducial_waveforms[interferometer.name] = wf
 
-    def compute_waveform_ratio_per_interferometer(self, waveform_polarizations, interferometer):
+    def compute_waveform_ratio_per_interferometer(self, waveform_polarizations, interferometer, parameters=None):
         name = interferometer.name
-        converted_parameters, _ = self.waveform_generator.parameter_conversion(self.parameters)
+        parameters = _resolve_parameters(self, parameters)
+        converted_parameters, _ = self.waveform_generator.parameter_conversion(parameters)
         strain = interferometer.get_detector_response_for_frequency_dependent_antenna_response(
             waveform_polarizations=waveform_polarizations,
             parameters=converted_parameters,
@@ -766,10 +790,14 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 self.parameter_bounds = self.get_parameter_list_from_dictionary(parameter_bounds)
             self.fiducial_parameters = self.find_maximum_likelihood_parameters(
                 self.parameter_bounds, maximization_kwargs=maximization_kwargs)
-        self.parameters.update(self.fiducial_parameters)
-        logger.info(f"Fiducial likelihood: {self.log_likelihood_ratio():.2f}")
-        self.fiducial_likelihood = self.log_likelihood_ratio()
-        self.parameters = dict(fiducial=0)
+        self.fiducial_likelihood = _log_likelihood_ratio_at(self, self.fiducial_parameters)
+        logger.info(f"Fiducial likelihood: {self.fiducial_likelihood:.2f}")
+        # Legacy parameter state for bilby < 2.8, where the sampler updates
+        # ``self.parameters`` in place rather than passing parameters.
+        if _PARAMETERS_AS_ARGUMENT:
+            self._parameters = dict(fiducial=0)
+        else:
+            self.parameters = dict(fiducial=0)
 
     def __repr__(self):
         return self.__class__.__name__ + '(interferometers={},\n\twaveform_generator={},\n\fiducial_parameters={},' \
@@ -1174,10 +1202,9 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
 
         if maximization_kwargs is None:
             maximization_kwargs = dict()
-        self.parameters.update(self.fiducial_parameters)
-        self.parameters["fiducial"] = 0
+        current_parameters = dict(self.fiducial_parameters, fiducial=0)
         updated_parameters_list = self.get_parameter_list_from_dictionary(self.fiducial_parameters)
-        old_fiducial_ln_likelihood = self.log_likelihood_ratio()
+        old_fiducial_ln_likelihood = _log_likelihood_ratio_at(self, current_parameters)
         logger.info(f"Fiducial ln likelihood ratio: {old_fiducial_ln_likelihood:.2f}")
         for it in range(iterations):
             logger.info(f"Optimizing fiducial parameters. Iteration : {it + 1}")
@@ -1189,11 +1216,11 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             )
             updated_parameters_list = output['x']
             updated_parameters = self.get_parameter_dictionary_from_list(updated_parameters_list)
-            self.parameters.update(updated_parameters)
+            current_parameters.update(updated_parameters)
             self.set_fiducial_waveforms(updated_parameters)
             self.setup_bins()
             self.compute_summary_data()
-            new_fiducial_ln_likelihood = self.log_likelihood_ratio()
+            new_fiducial_ln_likelihood = _log_likelihood_ratio_at(self, current_parameters)
             logger.info(f"Fiducial ln likelihood ratio: {new_fiducial_ln_likelihood:.2f}")
             if new_fiducial_ln_likelihood - old_fiducial_ln_likelihood < 0.1:
                 break
@@ -1216,8 +1243,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         log_likelihood: float
             The log likelihood value.
         """
-        self.parameters.update(self.get_parameter_dictionary_from_list(parameter_list))
-        return -self.log_likelihood_ratio()
+        parameters = dict(self.get_parameter_dictionary_from_list(parameter_list), fiducial=0)
+        return -_log_likelihood_ratio_at(self, parameters)
 
     def get_parameter_dictionary_from_list(self, parameter_list):
         parameter_dictionary = dict(zip(self.parameters_to_be_updated, parameter_list))
@@ -1484,15 +1511,16 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             # -<d|d>/2 without the parameter-independent -<n|n>/2
             self._noise_log_likelihood_value = -network_s_inner_s / 2 - network_s_inner_n
 
-    def compute_waveform_ratio_per_interferometer(self, waveform_polarizations, interferometer):
+    def compute_waveform_ratio_per_interferometer(self, waveform_polarizations, interferometer, parameters=None):
         name = interferometer.name
         r0, r1 = {}, {}
         waveform_args = self.waveform_generator.waveform_arguments.copy()
+        parameters = _resolve_parameters(self, parameters)
+        converted_parameters, _ = self.waveform_generator.parameter_conversion(parameters)
 
         for ell, emm in self.mode_array:
             mode_key = f"{ell},{emm}"
             waveform_polarizations_reduced = {mode_key: waveform_polarizations[mode_key]}
-            converted_parameters, _ = self.waveform_generator.parameter_conversion(self.parameters)
             strain = interferometer.get_detector_response_for_frequency_dependent_antenna_response(
                 waveform_polarizations=waveform_polarizations_reduced,
                 parameters=converted_parameters,
@@ -1509,7 +1537,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         self.waveform_generator.waveform_arguments = waveform_args.copy()
         return r0, r1
 
-    def _compute_full_waveform(self, signal_polarizations, interferometer):
+    def _compute_full_waveform(self, signal_polarizations, interferometer, parameters=None):
         """Reconstruct the full-resolution waveform ratio (only needed for
         time marginalisation's FFT, ``calculate_snrs``).
 
@@ -1529,7 +1557,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         close in size and the saving is small, but this is still the
         correct thing to index against).
         """
-        r0, r1 = self.compute_waveform_ratio_per_interferometer(signal_polarizations, interferometer)
+        r0, r1 = self.compute_waveform_ratio_per_interferometer(
+            signal_polarizations, interferometer, parameters=parameters)
         f = interferometer.frequency_array
         mask = interferometer.frequency_mask
         f_masked = f[mask]
@@ -1568,20 +1597,20 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         return_array: bool, optional
             If True, return the full waveform.
         parameters: dict, optional
-            The parameters to evaluate at; merged into ``self.parameters``
-            if given, which is otherwise used as-is (deprecated in
-            bilby >= 2.8, kept for callers that still rely on it).
+            The parameters to evaluate at (bilby >= 2.8 always passes
+            these). Falls back to the deprecated ``self.parameters`` state
+            only when not given.
 
         Returns
         -------
         calculated_snrs: namedtuple
             A named tuple containing calculated SNR values.
         """
-        if parameters is not None:
-            self.parameters.update(parameters)
+        parameters = _resolve_parameters(self, parameters)
         r0, r1 = self.compute_waveform_ratio_per_interferometer(
             waveform_polarizations=waveform_polarizations,
             interferometer=interferometer,
+            parameters=parameters,
         )
         a0 = self.summary_data[interferometer.name]['a0'].copy()
         a1 = self.summary_data[interferometer.name]['a1'].copy()
@@ -1606,6 +1635,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             full_waveform = self._compute_full_waveform(
                 signal_polarizations=waveform_polarizations,
                 interferometer=interferometer,
+                parameters=parameters,
             )
             d_inner_h_array = 4 / self.waveform_generator.duration * np.fft.fft(
                 full_waveform[0:-1]
