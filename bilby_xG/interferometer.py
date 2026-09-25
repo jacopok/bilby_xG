@@ -44,6 +44,53 @@ def _mode_integer(mode_key):
     return int(mode_key[-1])
 
 
+def compute_wave_frame(ra, dec, time, psi, frequencies, times_to_coalescence,
+                       earth_rotation=True):
+    """The detector-independent part of the frequency-dependent response.
+
+    The propagation direction ``omegas`` (shape ``(3, n)``) and the plus and
+    cross polarisation tensors (shape ``(3, 3, n)``) at each frequency, in
+    the Earth frame at the time that frequency is emitted (at the
+    coalescence time if ``earth_rotation`` is false). Every detector sees
+    the same frame, so it can be shared between detectors, see
+    :meth:`Interferometer.frequency_dependent_antenna_response`.
+    """
+    if earth_rotation:
+        gmst_at_tc = greenwich_mean_sidereal_time(time)
+        day = 24. * 60. * 60.
+        gmst_day_after = greenwich_mean_sidereal_time(time + day)
+        one_second_to_gmst = (gmst_day_after - gmst_at_tc) / day
+        gmsts = gmst_at_tc - one_second_to_gmst * times_to_coalescence
+    else:
+        gmsts = np.ones(len(frequencies)) * greenwich_mean_sidereal_time(time)
+
+    # basis vectors of the GW frame
+    thetas, phis = ra_dec_to_theta_phi(ra, dec, gmsts)
+    cosphis = np.cos(phis)
+    costhetas = np.cos(thetas)
+    sinphis = np.sin(phis)
+    sinthetas = np.sin(thetas)
+    u = np.zeros(shape=(3, len(phis)))
+    u[0] = cosphis * costhetas
+    u[1] = costhetas * sinphis
+    u[2] = -sinthetas
+    v = np.zeros(shape=(3, len(phis)))
+    v[0] = -sinphis
+    v[1] = cosphis
+    m = -u * np.sin(psi) - v * np.cos(psi)
+    n = -u * np.cos(psi) + v * np.sin(psi)
+    omegas = np.zeros(shape=(3, len(phis)))
+    omegas[0] = sinthetas * cosphis
+    omegas[1] = sinthetas * sinphis
+    omegas[2] = costhetas
+
+    # polarisation tensors
+    tmp = np.einsum('ik,jk->ijk', m, n)
+    pol_plus = np.einsum('ik,jk->ijk', m, m) - np.einsum('ik,jk->ijk', n, n)
+    pol_cross = tmp + np.transpose(tmp, axes=(1, 0, 2))
+    return omegas, pol_plus, pol_cross
+
+
 class Interferometer(_Interferometer):
     """An interferometer with a frequency-dependent antenna response.
 
@@ -259,7 +306,7 @@ class Interferometer(_Interferometer):
             self, ra, dec, time, psi, frequencies, start_time,
             times_to_coalescence, propagation=None,
             earth_rotation_time_delay=True, earth_rotation_beam_patterns=True,
-            finite_size=True):
+            finite_size=True, wave_frame=None):
         """Frequency-dependent plus/cross antenna response.
 
         See Nishizawa et al. (2009) arXiv:0903.0528 for the polarisation
@@ -287,6 +334,9 @@ class Interferometer(_Interferometer):
         earth_rotation_time_delay, earth_rotation_beam_patterns, finite_size: bool
             Toggle Earth-rotation time delay, Earth-rotation beam patterns and
             finite-size detector effects respectively.
+        wave_frame: tuple, optional
+            The output of :func:`compute_wave_frame` for these arguments, if already
+            computed (e.g. for another detector); computed here otherwise.
 
         Returns
         =======
@@ -301,39 +351,12 @@ class Interferometer(_Interferometer):
         if propagation is None:
             propagation = Propagation()
 
-        if earth_rotation_time_delay or earth_rotation_beam_patterns:
-            gmst_at_tc = greenwich_mean_sidereal_time(time)
-            day = 24. * 60. * 60.
-            gmst_day_after = greenwich_mean_sidereal_time(time + day)
-            one_second_to_gmst = (gmst_day_after - gmst_at_tc) / day
-            gmsts = gmst_at_tc - one_second_to_gmst * times_to_coalescence
+        if wave_frame is None:
+            omegas, pol_plus, pol_cross = compute_wave_frame(
+                ra, dec, time, psi, frequencies, times_to_coalescence,
+                earth_rotation=earth_rotation_time_delay or earth_rotation_beam_patterns)
         else:
-            gmsts = np.ones(len(frequencies)) * greenwich_mean_sidereal_time(time)
-
-        # basis vectors of the GW frame
-        thetas, phis = ra_dec_to_theta_phi(ra, dec, gmsts)
-        cosphis = np.cos(phis)
-        costhetas = np.cos(thetas)
-        sinphis = np.sin(phis)
-        sinthetas = np.sin(thetas)
-        u = np.zeros(shape=(3, len(phis)))
-        u[0] = cosphis * costhetas
-        u[1] = costhetas * sinphis
-        u[2] = -sinthetas
-        v = np.zeros(shape=(3, len(phis)))
-        v[0] = -sinphis
-        v[1] = cosphis
-        m = -u * np.sin(psi) - v * np.cos(psi)
-        n = -u * np.cos(psi) + v * np.sin(psi)
-        omegas = np.zeros(shape=(3, len(phis)))
-        omegas[0] = sinthetas * cosphis
-        omegas[1] = sinthetas * sinphis
-        omegas[2] = costhetas
-
-        # beam patterns
-        tmp = np.einsum('ik,jk->ijk', m, n)
-        pol_plus = np.einsum('ik,jk->ijk', m, m) - np.einsum('ik,jk->ijk', n, n)
-        pol_cross = tmp + np.transpose(tmp, axes=(1, 0, 2))
+            omegas, pol_plus, pol_cross = wave_frame
 
         if not finite_size:
             fps = np.einsum('ij,ijk->k', self.geometry.detector_tensor, pol_plus)
@@ -380,7 +403,7 @@ class Interferometer(_Interferometer):
     def get_detector_response_for_frequency_dependent_antenna_response(
             self, waveform_polarizations, parameters, start_time, frequencies,
             earth_rotation_time_delay=True, earth_rotation_beam_patterns=True,
-            finite_size=True):
+            finite_size=True, shared=None):
         """Combine waveform polarisations with the frequency-dependent response.
 
         Handles both the standard ``{"plus": ..., "cross": ...}`` polarisation
@@ -391,17 +414,35 @@ class Interferometer(_Interferometer):
         a sampled ``vG`` or ``(a, A)`` automatically enables the corresponding
         beyond-GR physics, while their absence recovers general relativity.
 
+        ``shared``, if given, is a dict in which the detector-independent
+        part of the response (time to coalescence, propagation phase and
+        :func:`compute_wave_frame`, per azimuthal mode number) is stored, and
+        reused by later calls for other detectors. The caller must pass a
+        fresh dict whenever ``parameters``, ``frequencies`` or the
+        Earth-rotation options change.
+
         Note: the calibration model is not applied here; only plus and cross
         modes are used.
         """
         propagation = build_propagation(parameters)
+        if shared is None:
+            shared = {}
+        earth_rotation = earth_rotation_time_delay or earth_rotation_beam_patterns
 
-        if 'plus' in waveform_polarizations.keys():
-            times_to_coalescence = calculate_time_to_merger_for_any_mode(
-                frequencies, parameters['mass_1'], parameters['mass_2'],
-                parameters['chi_1'], parameters['chi_2'], mode=2, safety=1)
-            correction_factor = np.exp(
-                1j * propagation.propagation_phase(frequencies, mode=2))
+        def response(mode, polarizations):
+            if mode not in shared:
+                times_to_coalescence = calculate_time_to_merger_for_any_mode(
+                    frequencies, parameters['mass_1'], parameters['mass_2'],
+                    parameters['chi_1'], parameters['chi_2'], mode=mode, safety=1)
+                shared[mode] = (
+                    times_to_coalescence,
+                    np.exp(1j * propagation.propagation_phase(frequencies, mode=mode)),
+                    compute_wave_frame(
+                        parameters['ra'], parameters['dec'],
+                        parameters['geocent_time'], parameters['psi'],
+                        frequencies, times_to_coalescence,
+                        earth_rotation=earth_rotation))
+            times_to_coalescence, correction_factor, frame = shared[mode]
             fps, fcs = self.frequency_dependent_antenna_response(
                 parameters['ra'], parameters['dec'], parameters['geocent_time'],
                 parameters['psi'],
@@ -412,35 +453,16 @@ class Interferometer(_Interferometer):
                 earth_rotation_time_delay=earth_rotation_time_delay,
                 finite_size=finite_size,
                 earth_rotation_beam_patterns=earth_rotation_beam_patterns,
+                wave_frame=frame,
             )
-            signal_ifo = correction_factor * (
-                waveform_polarizations['plus'] * fps
-                + waveform_polarizations['cross'] * fcs
-            )
-        else:
-            signal_ifo = np.zeros(len(frequencies), dtype=complex)
-            for mode_key in waveform_polarizations.keys():
-                mode = _mode_integer(mode_key)
-                times_to_coalescence = calculate_time_to_merger_for_any_mode(
-                    frequencies, parameters['mass_1'], parameters['mass_2'],
-                    parameters['chi_1'], parameters['chi_2'], mode=mode, safety=1)
-                correction_factor = np.exp(
-                    1j * propagation.propagation_phase(frequencies, mode=mode))
-                fps, fcs = self.frequency_dependent_antenna_response(
-                    parameters['ra'], parameters['dec'], parameters['geocent_time'],
-                    parameters['psi'],
-                    times_to_coalescence=times_to_coalescence,
-                    propagation=propagation,
-                    frequencies=frequencies,
-                    start_time=start_time,
-                    earth_rotation_time_delay=earth_rotation_time_delay,
-                    finite_size=finite_size,
-                    earth_rotation_beam_patterns=earth_rotation_beam_patterns,
-                )
-                signal_ifo += correction_factor * (
-                    waveform_polarizations[mode_key]['plus'] * fps
-                    + waveform_polarizations[mode_key]['cross'] * fcs
-                )
+            return correction_factor * (
+                polarizations['plus'] * fps + polarizations['cross'] * fcs)
+
+        if 'plus' in waveform_polarizations.keys():
+            return response(2, waveform_polarizations)
+        signal_ifo = np.zeros(len(frequencies), dtype=complex)
+        for mode_key in waveform_polarizations.keys():
+            signal_ifo += response(_mode_integer(mode_key), waveform_polarizations[mode_key])
         return signal_ifo
 
     def time_delay_from_geocenter(self, ra, dec, time, vG=1):

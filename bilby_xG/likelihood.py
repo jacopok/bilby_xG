@@ -78,6 +78,14 @@ __author__ = [
 _DEFAULT_GAMMA = np.array([-5 / 3, -2 / 3, 1, 5 / 3, 7 / 3])
 
 
+#: The parameters the detector-independent part of the response depends on
+#: (sky position, time, polarisation, the time-to-coalescence masses and spins,
+#: and the propagation model's parameters).
+_SHARED_RESPONSE_KEYS = (
+    "ra", "dec", "geocent_time", "psi", "mass_1", "mass_2", "chi_1", "chi_2",
+    "vG", "a", "A", "luminosity_distance", "H0")
+
+
 def relative_binning_bin_freqs(frequency_array, minimum_frequency, maximum_frequency,
                                 chi=1, epsilon=0.5, gamma=None):
     """Relative-binning frequency bin edges (Zackay et al. 2018, arXiv:1806.08792).
@@ -1511,12 +1519,25 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             # -<d|d>/2 without the parameter-independent -<n|n>/2
             self._noise_log_likelihood_value = -network_s_inner_s / 2 - network_s_inner_n
 
+    def _shared_response(self, converted_parameters):
+        """The detector-independent part of the response at the bin edges
+        (see ``shared`` in
+        :meth:`~bilby_xG.interferometer.Interferometer.get_detector_response_for_frequency_dependent_antenna_response`),
+        computed for the first interferometer of a likelihood evaluation
+        and reused for the others."""
+        key = tuple(converted_parameters.get(name) for name in _SHARED_RESPONSE_KEYS)
+        cache = getattr(self, "_shared_response_cache", None)
+        if cache is None or cache[0] != key or cache[1] is not self.bin_freqs:
+            cache = (key, self.bin_freqs, {})
+            self._shared_response_cache = cache
+        return cache[2]
+
     def compute_waveform_ratio_per_interferometer(self, waveform_polarizations, interferometer, parameters=None):
         name = interferometer.name
         r0, r1 = {}, {}
-        waveform_args = self.waveform_generator.waveform_arguments.copy()
         parameters = _resolve_parameters(self, parameters)
         converted_parameters, _ = self.waveform_generator.parameter_conversion(parameters)
+        shared = self._shared_response(converted_parameters)
 
         for ell, emm in self.mode_array:
             mode_key = f"{ell},{emm}"
@@ -1528,13 +1549,13 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 frequencies=self.bin_freqs,
                 earth_rotation_time_delay=self.earth_rotation_time_delay,
                 earth_rotation_beam_patterns=self.earth_rotation_beam_patterns,
-                finite_size=self.finite_size)
+                finite_size=self.finite_size,
+                shared=shared)
             reference_strain = self.per_detector_per_mode_fiducial_waveform_points[name][mode_key]
             waveform_ratio = strain / reference_strain
             r0[mode_key] = 0.5 * (waveform_ratio[1:] + waveform_ratio[:-1])
             r1[mode_key] = (waveform_ratio[1:] - waveform_ratio[:-1]) / self.bin_widths
 
-        self.waveform_generator.waveform_arguments = waveform_args.copy()
         return r0, r1
 
     def _compute_full_waveform(self, signal_polarizations, interferometer, parameters=None):

@@ -153,3 +153,25 @@ def test_read_frequency_domain_data_chunked(tmp_path):
         tmp_path / "strain.npy", chunksize=37)
     np.testing.assert_allclose(strain, ifo.frequency_domain_strain)
     assert isinstance(strain, np.memmap)
+
+
+def test_detector_independent_response_is_shared():
+    """Reusing one interferometer's wave frame for the others changes nothing."""
+    ifos = InterferometerList(["ET-EMR"])
+    frequencies = np.geomspace(3.0, 2048.0, 50)
+    parameters = dict(mass_1=1.45, mass_2=1.3, chi_1=0.01, chi_2=0.0, ra=3.4,
+                      dec=-0.4, psi=1.0, geocent_time=1187008882.4,
+                      luminosity_distance=200.0, vG=0.99)
+    polarizations = {key: {"plus": np.exp(1j * frequencies * k),
+                           "cross": np.exp(2j * frequencies * k)}
+                     for k, key in enumerate(["2,2", "2,1", "3,3", "3,2"], 1)}
+    for flags in [(True, True, True), (False, False, True), (True, False, False)]:
+        kwargs = dict(parameters=parameters, start_time=parameters["geocent_time"] - 1000,
+                      frequencies=frequencies, earth_rotation_time_delay=flags[0],
+                      earth_rotation_beam_patterns=flags[1], finite_size=flags[2])
+        shared = {}
+        for ifo in ifos:
+            response = ifo.get_detector_response_for_frequency_dependent_antenna_response
+            np.testing.assert_array_equal(response(polarizations, shared=shared, **kwargs),
+                                          response(polarizations, **kwargs))
+        assert set(shared) == {1, 2, 3}
