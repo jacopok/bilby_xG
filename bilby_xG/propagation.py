@@ -29,6 +29,7 @@ standard frequency-dependent-response result when no beyond-GR parameter is
 sampled.
 """
 import numpy as np
+from scipy.integrate import trapezoid
 
 __author__ = ["Pratyusava Baral <pbaral@uwm.edu>"]
 
@@ -187,7 +188,7 @@ class ModifiedDispersion(Propagation):
         integrand = (1 + z_array) ** (a - 2) / np.sqrt(
             Omega_m * (1 + z_array) ** 3 + Omega_de
         )
-        D_a = (1 + z) ** (1 - a) / H_0 * np.trapz(integrand, z_array)
+        D_a = (1 + z) ** (1 - a) / H_0 * trapezoid(integrand, z_array)
 
         D_L = self.luminosity_distance * _MPC_TO_S
         lambda_A_eff = ((1 + z) ** (1 - a) * D_L / D_a) ** (1 / (a - 2)) * lambda_A
