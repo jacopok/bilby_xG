@@ -8,16 +8,20 @@ Prototype. :class:`BatchedRelativeBinningLikelihood` wraps an existing
 built with :func:`~bilby_xG.source.mlgw_bns_individual_modes`, and reuses
 its bins, fiducial waveforms and summary data. Its
 :meth:`~BatchedRelativeBinningLikelihood.log_likelihood_ratio` takes a
-dict of parameter *arrays* and evaluates all of them in a single jitted,
-``vmap``-ed JAX function: the mlgw_bns surrogate (through the JAX building
-blocks shipped in :mod:`mlgw_bns.jax_predict`), the frequency-dependent
-detector response and the summary-data contraction.
+dict of parameter *arrays* and evaluates all of them in a single jitted
+JAX function: the mlgw_bns surrogate, evaluated for the whole batch at once
+through its public batched interface
+(:meth:`mlgw_bns.model.Model.jax_modes_amp_phase` and
+:func:`mlgw_bns.batched.mode_polarizations`), then, ``vmap``-ed over the
+batch, the frequency-dependent detector response and the summary-data
+contraction.
 
 Scope of the prototype: general relativity only (no ``vG`` / ``(a, A)``),
 no distance/phase/time marginalisation, ``reference_frame="sky"`` with
-geocentre time. The JAX surrogate agrees with the numpy one to ~1e-4
-in the inspiral; see ``benchmarks/et_mlgw_bns_batched.py`` for the
-resulting log-likelihood differences and the speed-up.
+geocentre time. The JAX surrogate agrees with the numpy one only to the
+rounding of its kernel-ridge regressors (see :mod:`mlgw_bns.batched`); see
+``benchmarks/et_mlgw_bns_batched.py`` for the resulting log-likelihood
+differences and the speed-up.
 
 :class:`BatchedBilbyModel` and :class:`BatchedNessai` connect it to nessai:
 pass ``sampler=BatchedNessai`` to :func:`bilby.run_sampler`.
@@ -33,143 +37,30 @@ from .utils import calculate_time_to_merger_for_any_mode
 
 __author__ = ["Jacopo Tissino"]
 
-#: Solar mass in seconds, as used by mlgw_bns.
-_SUN_MASS_SECONDS = 4.92549094830932e-6
-#: mlgw_bns amplitude unit.
-_AMP_SI_BASE = 4.2425873413901263e24
 _DAY = 24. * 60. * 60.
 
 
-def _ylm_iota(ell, emm, iota, xp):
-    """``-2Y_lm(iota, 0)`` (real), the same convention as
-    :func:`bilby_xG.source._spin_weighted_ylm`."""
-    s = 2  # -(spin weight)
-    c, s_ = xp.cos(iota / 2), xp.sin(iota / 2)
-    norm = math.sqrt(math.factorial(ell + emm) * math.factorial(ell - emm)
-                     * math.factorial(ell + s) * math.factorial(ell - s))
-    out = 0.0
-    for k in range(max(0, emm - s), min(ell + emm, ell - s) + 1):
-        out = out + ((-1) ** k * c ** (2 * ell + emm - s - 2 * k) * s_ ** (2 * k + s - emm)
-                     / (math.factorial(k) * math.factorial(ell + emm - k)
-                        * math.factorial(ell - s - k) * math.factorial(s - emm + k)))
-    return math.sqrt((2 * ell + 1) / (4 * math.pi)) * norm * out
-
-
-def _mode_coefficients(ell, emm, iota, azimuth, xp):
-    """The eight real coefficients of mlgw_bns' ``_build_mode_coeffs`` for
-    one mode, with ``Y_lm(iota, phi) = Y_lm(iota, 0) exp(i m phi)``."""
-    y, y_m = _ylm_iota(ell, emm, iota, xp), _ylm_iota(ell, -emm, iota, xp)
-    cos, sin = xp.cos(emm * azimuth), xp.sin(emm * azimuth)
-    yr, yi = y * cos, y * sin
-    yr_m, yi_m = y_m * cos, -y_m * sin
-    if ell % 2:
-        return (yr - yr_m, -(yi + yi_m), yi + yi_m, yr - yr_m,
-                -(yi - yi_m), -(yr + yr_m), yr + yr_m, -(yi - yi_m))
-    return (yr + yr_m, -(yi - yi_m), yi - yi_m, yr + yr_m,
-            -(yi + yi_m), -(yr - yr_m), yr - yr_m, -(yi + yi_m))
-
-
 def mlgw_bns_jax_modes(model, mode_array):
-    """A JAX function evaluating selected mlgw_bns modes for one parameter set.
+    """A JAX function evaluating selected mlgw_bns modes for a batch.
 
     Returns ``modes(theta, total_mass, distance, inclination, phase,
-    frequencies) -> (plus, cross)``, each of shape ``(n_modes, n_freqs)``,
-    with ``theta = [q >= 1, lambda_1, lambda_2, chi_1, chi_2]``: the same
+    frequencies) -> (plus, cross)``, each of shape ``(n, n_modes, n_freqs)``,
+    with ``theta`` of shape ``(n, 5)``, rows ``[q >= 1, lambda_1, lambda_2,
+    chi_1, chi_2]``, and the other parameters of shape ``(n,)``: the same
     per-mode polarisations as :func:`bilby_xG.source.mlgw_bns_individual_modes`
-    (up to the JAX port's ~1e-4 accuracy). Use with ``jax.vmap``.
+    (up to the rounding of the surrogate's regressors). Rows outside the
+    surrogate's range are NaN.
     """
     import jax.numpy as jnp
-    from mlgw_bns.higher_order_modes import Mode
-    from mlgw_bns.jax_predict import (
-        _mode_pn_amp, _mode_pn_phase, make_not_a_knot_spline_jax,
-        mode_model_to_jax_residuals, mode_phases_nn_to_jax, timeshifts_nn_to_jax)
+    from mlgw_bns.batched import mode_polarizations
 
-    dataset = model.dataset
-    reference_mass = float(dataset.total_mass)
-    connection_hz = float(dataset.effective_initial_frequency_hz)
-    connection_natural = connection_hz * float(dataset.mass_sum_seconds)
-    reference = dataset.amplitude_reference_parameters
-    if reference is None:
-        raise NotImplementedError("needs a model with a frozen PN amplitude reference")
-    reference_eta = reference.mass_ratio / (1 + reference.mass_ratio) ** 2
-    reference_chi_a = (reference.chi_1 - reference.chi_2) / 2
-    reference_chi_s = (reference.chi_1 + reference.chi_2) / 2
-
-    phases_predictor = model.mode_phases_predictor
-    mode_phases = mode_phases_nn_to_jax(phases_predictor, model.modes)
-    phase_columns = [tuple(mode) for mode in phases_predictor.modes]
-    time_shifts = timeshifts_nn_to_jax(model.time_shifts_predictor)
-
-    per_mode = []
-    for ell, emm in mode_array:
-        mode_model = model.mode_models[Mode(ell, emm)]
-        indices = mode_model.downsampling_indices
-        hz = np.asarray(mode_model.dataset.frequencies_hz)
-        natural = np.asarray(mode_model.dataset.frequencies)
-        per_mode.append(dict(
-            lm=(ell, emm),
-            residuals=mode_model_to_jax_residuals(mode_model),
-            n_amp=indices.amp_length,
-            amp_spline=make_not_a_knot_spline_jax(hz[indices.amplitude_indices]),
-            phi_spline=make_not_a_knot_spline_jax(hz[indices.phase_indices]),
-            phi_natural=jnp.asarray(natural[indices.phase_indices]),
-            pn_amp=_mode_pn_amp((ell, emm), jnp.asarray(natural[indices.amplitude_indices]),
-                                reference_eta, reference_chi_a, reference_chi_s),
-            phase_column=phase_columns.index((ell, emm)),
-            max_hz=float(hz[-1]),
-        ))
+    predict = model.jax_modes_amp_phase(mode_array)
 
     def modes(theta, total_mass, distance, inclination, phase, frequencies):
-        q, lambda_1, lambda_2, chi_1, chi_2 = theta
-        eta = q / (1 + q) ** 2
-        chi_a, chi_s = (chi_1 - chi_2) / 2, (chi_1 + chi_2) / 2
-        row = theta[None, :]
-        mass_rescaling = total_mass / reference_mass
-        rescaled = frequencies * mass_rescaling
-        natural = frequencies * total_mass * _SUN_MASS_SECONDS
-        # post-Newtonian extension below the trained band, blended in over
-        # [connection / 2, connection] (mlgw_bns' low-frequency splice)
-        low = rescaled < connection_hz
-        blend = jnp.clip((rescaled - connection_hz / 2) / (connection_hz / 2), 0.0, 1.0)
-        blend = (1 - jnp.cos(math.pi * blend)) / 2
-        time_shift = time_shifts(row)[0] * mass_rescaling
-        time_shift_phase = 2 * math.pi * (frequencies - connection_hz / mass_rescaling) * time_shift
-        phase0 = mode_phases(row)[0]
-        azimuth = math.pi / 2 - phase
-        prefactor = total_mass ** 2 / _AMP_SI_BASE / distance / 2
-
-        plus, cross = [], []
-        for m in per_mode:
-            lm = m["lm"]
-            residuals = m["residuals"](row)[0]
-            amp_nodes = m["pn_amp"] * residuals[:m["n_amp"]]
-            phi_nodes = (_mode_pn_phase(lm, m["phi_natural"], eta, chi_1, chi_2, chi_a, chi_s,
-                                        lambda_1, lambda_2)
-                         + residuals[m["n_amp"]:] + phase0[m["phase_column"]])
-            amp = m["amp_spline"](amp_nodes, rescaled)
-            phi = m["phi_spline"](phi_nodes, rescaled)
-
-            amp_connection = m["amp_spline"](amp_nodes, jnp.asarray(connection_hz))
-            phi_connection = m["phi_spline"](phi_nodes, jnp.asarray(connection_hz))
-            natural_connection = jnp.asarray([connection_natural])
-            low_amp = _mode_pn_amp(lm, natural, eta, chi_a, chi_s)
-            low_phi = _mode_pn_phase(lm, natural, eta, chi_1, chi_2, chi_a, chi_s,
-                                     lambda_1, lambda_2)
-            low_amp_connection = _mode_pn_amp(lm, natural_connection, eta, chi_a, chi_s)[0]
-            low_phi_connection = _mode_pn_phase(
-                lm, natural_connection, eta, chi_1, chi_2, chi_a, chi_s, lambda_1, lambda_2)[0]
-            amp = jnp.where(low, low_amp + blend * (amp_connection - low_amp_connection), amp)
-            phi = jnp.where(low, low_phi + (phi_connection - low_phi_connection), phi)
-            amp = jnp.where(rescaled > m["max_hz"], 0.0, amp) * prefactor
-            phi = phi + time_shift_phase
-
-            c = _mode_coefficients(*lm, inclination, azimuth, jnp)
-            cos, sin = jnp.cos(phi), jnp.sin(phi)
-            plus.append(amp * ((cos * c[0] + sin * c[1]) + 1j * (cos * c[2] + sin * c[3])))
-            cross.append(amp * ((cos * c[4] + sin * c[5]) + 1j * (cos * c[6] + sin * c[7])))
-        positive = frequencies > 0
-        return (jnp.where(positive, jnp.stack(plus), 0.0),
-                jnp.where(positive, jnp.stack(cross), 0.0))
+        amp, phi = predict(theta, total_mass, frequencies, distance)
+        # pi/2 - phase: the azimuth convention of the TEOBResumS SPA models
+        return mode_polarizations(amp, phi, mode_array, inclination,
+                                  jnp.pi / 2 - phase, xp=jnp)
 
     return modes
 
@@ -294,16 +185,25 @@ class BatchedRelativeBinningLikelihood(Likelihood):
                        bool(likelihood.earth_rotation_beam_patterns),
                        bool(likelihood.finite_size))
         self._modes = mlgw_bns_jax_modes(_mlgw_bns_model(), self.mode_array)
-        self._batched = jax.jit(jax.vmap(self._single, in_axes=(0, None)))
+        self._batched = jax.jit(self._batch)
 
-    def _single(self, p, arrays):
-        """ln L ratio for one parameter set (a dict of scalars)."""
+    def _batch(self, p, arrays):
+        """ln L ratio for a batch of parameter sets (a dict of arrays)."""
+        import jax
+        import jax.numpy as jnp
+
+        theta = jnp.stack([p["q"], p["lambda_1"], p["lambda_2"], p["chi_1"], p["chi_2"]], axis=1)
+        plus, cross = self._modes(theta, p["total_mass"], p["distance"], p["inclination"],
+                                  p["phase"], arrays["frequencies"])
+        ln_l = jax.vmap(self._project, in_axes=(0, 0, 0, None))(p, plus, cross, arrays)
+        # outside the surrogate's range: outside the support
+        return jnp.where(jnp.isnan(ln_l), -jnp.inf, ln_l)
+
+    def _project(self, p, plus, cross, arrays):
+        """ln L ratio for one parameter set, given its modes ``(n_modes, n_freqs)``."""
         import jax.numpy as jnp
 
         f = arrays["frequencies"]
-        theta = jnp.stack([p["q"], p["lambda_1"], p["lambda_2"], p["chi_1"], p["chi_2"]])
-        plus, cross = self._modes(theta, p["total_mass"], p["distance"], p["inclination"],
-                                  p["phase"], f)
         ifo_time = p["geocent_time"] - self.start_time
         earth_rotation = self._flags[0] or self._flags[1]
 

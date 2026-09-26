@@ -46,8 +46,25 @@ def test_mlgw_bns_modes_match_the_surrogate():
         total_mass=params["M"], reference_phase=0.0, time_shift=0.0))
     for key, pols in modes.items():
         ell, emm = (int(part) for part in key.split(","))
-        np.testing.assert_allclose(pols["plus"] - 1j * pols["cross"], expected[(ell, emm)],
-                                   rtol=1e-12, atol=0)
+        # mlgw_bns' batched evaluation reproduces predict_modes_dict to the
+        # rounding of phases of up to ~1e6 rad
+        scale = np.max(np.abs(expected[(ell, emm)]))
+        np.testing.assert_allclose((pols["plus"] - 1j * pols["cross"]) / scale,
+                                   expected[(ell, emm)] / scale, rtol=0, atol=1e-7)
+
+
+def test_mlgw_bns_modes_accept_small_lambda():
+    """The surrogate's training guard lambda >= 5 is relaxed for every mode."""
+    pytest.importorskip("mlgw_bns")
+    from bilby_xG.source import convert_to_mlgw_bns_parameters, mlgw_bns_individual_modes
+
+    params, _ = convert_to_mlgw_bns_parameters(dict(PARAMETERS, lambda_1=0.0, lambda_2=1.0))
+    modes = mlgw_bns_individual_modes(np.geomspace(5.0, 1000.0, 20),
+                                      **{key: params[key] for key in SOURCE_KEYS})
+    assert all(np.all(np.isfinite(pols["plus"])) for pols in modes.values())
+    with pytest.raises(ValueError):
+        mlgw_bns_individual_modes(np.geomspace(5.0, 1000.0, 20), **dict(
+            {key: params[key] for key in SOURCE_KEYS}, chi1z=0.9))
 
 
 def test_teobresums_spa_modes():
