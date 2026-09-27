@@ -6,7 +6,8 @@ Extends :class:`bilby.gw.detector.interferometer.Interferometer` with the
 finite-size, Earth-rotation-aware antenna response needed for
 kilometre-to-tens-of-kilometre next-generation detectors (Cosmic Explorer,
 Einstein Telescope), following Baral et al. (2023), arXiv:2304.09889 and
-Nishizawa et al. (2009), arXiv:0903.0528.
+Nishizawa et al. (2009), arXiv:0903.0528, and optionally the motion of the
+geocentre in the Solar System (:mod:`bilby_xG.orbit`).
 
 The single, physics-agnostic response method takes an optional
 :class:`~bilby_xG.propagation.Propagation` model. With the default (general
@@ -26,6 +27,7 @@ from bilby.gw.detector.calibration import Recalibrate
 from bilby.gw.detector.interferometer import Interferometer as _Interferometer
 
 from .geometry import InterferometerGeometry
+from .orbit import orbital_time_delay
 from .propagation import Propagation, build_propagation
 from .utils import calculate_time_to_merger_for_any_mode
 
@@ -306,7 +308,8 @@ class Interferometer(_Interferometer):
             self, ra, dec, time, psi, frequencies, start_time,
             times_to_coalescence, propagation=None,
             earth_rotation_time_delay=True, earth_rotation_beam_patterns=True,
-            finite_size=True, wave_frame=None):
+            finite_size=True, wave_frame=None, orbital_motion=True,
+            orbital_delay=None):
         """Frequency-dependent plus/cross antenna response.
 
         See Nishizawa et al. (2009) arXiv:0903.0528 for the polarisation
@@ -337,6 +340,12 @@ class Interferometer(_Interferometer):
         wave_frame: tuple, optional
             The output of :func:`compute_wave_frame` for these arguments, if already
             computed (e.g. for another detector); computed here otherwise.
+        orbital_motion: bool
+            Include the motion of the geocentre in the Solar System, see
+            :mod:`bilby_xG.orbit`.
+        orbital_delay: array_like, optional
+            The output of :func:`bilby_xG.orbit.orbital_time_delay` for these
+            arguments, if already computed; computed here otherwise.
 
         Returns
         =======
@@ -394,6 +403,10 @@ class Interferometer(_Interferometer):
         ifo_times = time - start_time + dts
         if not earth_rotation_time_delay:
             ifo_times = ifo_times[-1]
+        if orbital_motion:
+            if orbital_delay is None:
+                orbital_delay = orbital_time_delay(ra, dec, time, times_to_coalescence)
+            ifo_times = ifo_times + orbital_delay / group_velocity
 
         exp_fac = np.exp(-1j * 2. * np.pi * frequencies * ifo_times)
         fps = fps * exp_fac
@@ -403,7 +416,7 @@ class Interferometer(_Interferometer):
     def get_detector_response_for_frequency_dependent_antenna_response(
             self, waveform_polarizations, parameters, start_time, frequencies,
             earth_rotation_time_delay=True, earth_rotation_beam_patterns=True,
-            finite_size=True, shared=None):
+            finite_size=True, shared=None, orbital_motion=True):
         """Combine waveform polarisations with the frequency-dependent response.
 
         Handles both the standard ``{"plus": ..., "cross": ...}`` polarisation
@@ -416,10 +429,14 @@ class Interferometer(_Interferometer):
 
         ``shared``, if given, is a dict in which the detector-independent
         part of the response (time to coalescence, propagation phase and
-        :func:`compute_wave_frame`, per azimuthal mode number) is stored, and
-        reused by later calls for other detectors. The caller must pass a
-        fresh dict whenever ``parameters``, ``frequencies`` or the
-        Earth-rotation options change.
+        :func:`compute_wave_frame` and the orbital-motion delay, per
+        azimuthal mode number) is stored, and reused by later calls for other
+        detectors. The caller must pass a fresh dict whenever ``parameters``,
+        ``frequencies`` or the Earth-rotation/orbital-motion options change.
+
+        ``orbital_motion`` includes the motion of the geocentre in the Solar
+        System (see :mod:`bilby_xG.orbit`); with it, the detector-frame
+        masses are those of the Solar-System-barycentre frame.
 
         Note: the calibration model is not applied here; only plus and cross
         modes are used.
@@ -441,8 +458,12 @@ class Interferometer(_Interferometer):
                         parameters['ra'], parameters['dec'],
                         parameters['geocent_time'], parameters['psi'],
                         frequencies, times_to_coalescence,
-                        earth_rotation=earth_rotation))
-            times_to_coalescence, correction_factor, frame = shared[mode]
+                        earth_rotation=earth_rotation),
+                    orbital_time_delay(
+                        parameters['ra'], parameters['dec'],
+                        parameters['geocent_time'], times_to_coalescence)
+                    if orbital_motion else None)
+            times_to_coalescence, correction_factor, frame, orbital_delay = shared[mode]
             fps, fcs = self.frequency_dependent_antenna_response(
                 parameters['ra'], parameters['dec'], parameters['geocent_time'],
                 parameters['psi'],
@@ -454,6 +475,8 @@ class Interferometer(_Interferometer):
                 finite_size=finite_size,
                 earth_rotation_beam_patterns=earth_rotation_beam_patterns,
                 wave_frame=frame,
+                orbital_motion=orbital_motion,
+                orbital_delay=orbital_delay,
             )
             return correction_factor * (
                 polarizations['plus'] * fps + polarizations['cross'] * fcs)

@@ -158,6 +158,10 @@ class GravitationalWaveTransientNextGeneration(GravitationalWaveTransient):
         Default True.
     finite_size: bool, optional
         Include finite-size detector effects. Default True.
+    orbital_motion: bool, optional
+        Include the motion of the geocentre in the Solar System (masses are
+        then in the Solar-System-barycentre frame, see
+        :mod:`bilby_xG.orbit`). Default True.
     """
 
     def __init__(self, interferometers, waveform_generator, time_marginalization=False,
@@ -167,7 +171,7 @@ class GravitationalWaveTransientNextGeneration(GravitationalWaveTransient):
                  number_of_response_curves=1000, starting_index=0, jitter_time=True,
                  reference_frame="sky", time_reference="geocenter",
                  earth_rotation_beam_patterns=True, earth_rotation_time_delay=True,
-                 finite_size=True):
+                 finite_size=True, orbital_motion=True):
 
         super().__init__(
             interferometers, waveform_generator, time_marginalization,
@@ -180,6 +184,7 @@ class GravitationalWaveTransientNextGeneration(GravitationalWaveTransient):
         self.earth_rotation_beam_patterns = earth_rotation_beam_patterns
         self.earth_rotation_time_delay = earth_rotation_time_delay
         self.finite_size = finite_size
+        self.orbital_motion = orbital_motion
 
     def _compute_full_waveform(self, signal_polarizations, interferometer, parameters=None):
         """Project the waveform onto the frequency-dependent detector response.
@@ -226,7 +231,8 @@ class GravitationalWaveTransientNextGeneration(GravitationalWaveTransient):
                 frequencies=freqs,
                 earth_rotation_time_delay=self.earth_rotation_time_delay,
                 earth_rotation_beam_patterns=self.earth_rotation_beam_patterns,
-                finite_size=self.finite_size)
+                finite_size=self.finite_size,
+                orbital_motion=self.orbital_motion)
 
         return h
 
@@ -248,6 +254,9 @@ class MBGravitationalWaveTransientNextGeneration(MBGravitationalWaveTransient):
         Apply the Earth-rotation modulation to the propagation delay. Default True.
     finite_size: bool, optional
         Apply finite-size detector effects. Default True.
+    orbital_motion: bool, optional
+        Apply the motion of the geocentre in the Solar System (see
+        :mod:`bilby_xG.orbit`). Default True.
     response_update: float, optional
         Time interval for updating the detector response. **Not implemented** in
         this release: only the default (``None``, update at every evaluation) is
@@ -261,7 +270,8 @@ class MBGravitationalWaveTransientNextGeneration(MBGravitationalWaveTransient):
         distance_marginalization=False, phase_marginalization=False, priors=None,
         distance_marginalization_lookup_table=None, reference_frame="sky",
         time_reference="geocenter", earth_rotation_beam_patterns=True,
-        earth_rotation_time_delay=True, finite_size=True, response_update=None
+        earth_rotation_time_delay=True, finite_size=True, response_update=None,
+        orbital_motion=True
     ):
         super().__init__(
             interferometers=interferometers, waveform_generator=waveform_generator,
@@ -279,6 +289,7 @@ class MBGravitationalWaveTransientNextGeneration(MBGravitationalWaveTransient):
         self.earth_rotation_beam_patterns = earth_rotation_beam_patterns
         self.earth_rotation_time_delay = earth_rotation_time_delay
         self.finite_size = finite_size
+        self.orbital_motion = orbital_motion
         if response_update is not None:
             raise NotImplementedError(
                 "response_update is not supported; the detector response is "
@@ -321,7 +332,8 @@ class MBGravitationalWaveTransientNextGeneration(MBGravitationalWaveTransient):
             frequencies=self.banded_frequency_points,
             earth_rotation_time_delay=self.earth_rotation_time_delay,
             earth_rotation_beam_patterns=self.earth_rotation_beam_patterns,
-            finite_size=self.finite_size)
+            finite_size=self.finite_size,
+            orbital_motion=self.orbital_motion)
 
         d_inner_h = np.dot(h, self.linear_coeffs[interferometer.name])
 
@@ -436,6 +448,9 @@ class RelativeBinningGravitationalWaveTransientNextGeneration(RelativeBinningGra
         If true, the time delay is rotated with the Earth. Default is True.
     finite_size: bool, optional
         If true, the finite size effect is included. Default is True.
+    orbital_motion: bool, optional
+        If true, the motion of the geocentre in the Solar System is included
+        (see :mod:`bilby_xG.orbit`). Default is True.
 
     Returns
     -------
@@ -467,11 +482,13 @@ class RelativeBinningGravitationalWaveTransientNextGeneration(RelativeBinningGra
             epsilon=0.5,
             earth_rotation_beam_patterns=True,
             earth_rotation_time_delay=True,
-            finite_size=True):
+            finite_size=True,
+            orbital_motion=True):
 
         self.earth_rotation_beam_patterns = earth_rotation_beam_patterns
         self.earth_rotation_time_delay = earth_rotation_time_delay
         self.finite_size = finite_size
+        self.orbital_motion = orbital_motion
 
         super(RelativeBinningGravitationalWaveTransientNextGeneration, self).__init__(
             interferometers=interferometers,
@@ -527,7 +544,8 @@ class RelativeBinningGravitationalWaveTransientNextGeneration(RelativeBinningGra
                 frequencies=freqs,
                 earth_rotation_time_delay=self.earth_rotation_time_delay,
                 earth_rotation_beam_patterns=self.earth_rotation_beam_patterns,
-                finite_size=self.finite_size)
+                finite_size=self.finite_size,
+                orbital_motion=self.orbital_motion)
 
             wf[frequencies > self.maximum_frequency] = 0
             self.per_detector_fiducial_waveforms[interferometer.name] = wf
@@ -543,7 +561,8 @@ class RelativeBinningGravitationalWaveTransientNextGeneration(RelativeBinningGra
             frequencies=self.bin_freqs,
             earth_rotation_time_delay=self.earth_rotation_time_delay,
             earth_rotation_beam_patterns=self.earth_rotation_beam_patterns,
-            finite_size=self.finite_size)
+            finite_size=self.finite_size,
+            orbital_motion=self.orbital_motion)
 
         reference_strain = self.per_detector_fiducial_waveform_points[name]
         waveform_ratio = strain / reference_strain
@@ -701,6 +720,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                  earth_rotation_time_delay=True,
                  earth_rotation_beam_patterns=True,
                  finite_size=True,
+                 orbital_motion=True,
                  summary_data_chunk_size=2 ** 20,
                  array_cache_dir=None,
                  injection=None):
@@ -758,6 +778,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         self.earth_rotation_time_delay = earth_rotation_time_delay
         self.earth_rotation_beam_patterns = earth_rotation_beam_patterns
         self.finite_size = finite_size
+        self.orbital_motion = orbital_motion
         # Frequency samples processed at once when building the summary data.
         # Keeping this well below the full band means the full-resolution
         # fiducial waveform never has to be held in memory at once.
@@ -1300,7 +1321,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 frequencies=freqs,
                 earth_rotation_time_delay=self.earth_rotation_time_delay,
                 earth_rotation_beam_patterns=self.earth_rotation_beam_patterns,
-                finite_size=self.finite_size)
+                finite_size=self.finite_size,
+                orbital_motion=self.orbital_motion)
         wf[frequencies > self.maximum_frequency] = 0
         return wf
 
@@ -1550,6 +1572,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 earth_rotation_time_delay=self.earth_rotation_time_delay,
                 earth_rotation_beam_patterns=self.earth_rotation_beam_patterns,
                 finite_size=self.finite_size,
+                orbital_motion=self.orbital_motion,
                 shared=shared)
             reference_strain = self.per_detector_per_mode_fiducial_waveform_points[name][mode_key]
             waveform_ratio = strain / reference_strain

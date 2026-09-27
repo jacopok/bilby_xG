@@ -33,6 +33,7 @@ dependencies = [
     "bilby>=2.3",
     "bilby.cython>=0.4.0",
     "numpy",
+    "pyerfa",
     "scipy",
 ]
 

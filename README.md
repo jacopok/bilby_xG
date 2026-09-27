@@ -49,6 +49,7 @@ The package mirrors bilby's module layout:
 | `bilby_xG.likelihood` | `GravitationalWaveTransientNextGeneration` and its multi-banded and relative-binning variants |
 | `bilby_xG.source` | CBC source models, including the individual-mode (higher-order-mode) models |
 | `bilby_xG.injection` | `SummaryDataInjection`: a signal in Gaussian or zero noise simulated directly as relative-binning summary data, with no full-band data array (pass it as `injection=` to the mode-by-mode relative-binning likelihood); `inject_zero_noise_chunked` for the full noiseless strain |
+| `bilby_xG.orbit` | Motion of the geocentre in the Solar System: a lazily-tabulated barycentric ephemeris and the resulting arrival-time delay |
 | `bilby_xG.propagation` | `Propagation` (GR), `SpeedOfGravity`, `ModifiedDispersion`, `build_propagation` |
 | `bilby_xG.conversion` | CBC parameter conversions that also accept `log10_luminosity_distance` |
 | `bilby_xG.utils` | time-to-merger estimate and shipped-data lookup helpers |
@@ -104,6 +105,25 @@ You can also build a model directly:
 ```python
 from bilby_xG.propagation import SpeedOfGravity, ModifiedDispersion
 ```
+
+### Detector motion
+
+The response includes the rotation of the Earth (`earth_rotation_time_delay`,
+`earth_rotation_beam_patterns`), the finite size of the detectors
+(`finite_size`) and the motion of the geocentre in the Solar System
+(`orbital_motion`), each of which can be switched off with the keyword of the
+same name on the likelihoods, injections and the response methods; all
+default to `True`.
+
+With `orbital_motion=True` the detector-frame masses and distance are those
+of the Solar-System-barycentre frame. To first order in `v/c` they differ
+from those inferred with `orbital_motion=False` (a frame comoving with the
+geocentre at coalescence) by the Doppler factor
+`bilby_xG.orbit.doppler_factor(ra, dec, geocent_time)`, i.e. `1 - n.v/c`,
+a ~1e-4 effect: `M(orbital_motion=False) = doppler_factor * M(orbital_motion=True)`.
+The departure of the orbit from uniform motion over a GW170817-like signal
+is quantified in `benchmarks/orbital_motion_curvature.py`, and the accuracy
+of the cached ephemeris in `benchmarks/orbital_motion_validation.py`.
 
 ## Shipped data
 
