@@ -6,8 +6,9 @@ Extends :class:`bilby.gw.detector.interferometer.Interferometer` with the
 finite-size, Earth-rotation-aware antenna response needed for
 kilometre-to-tens-of-kilometre next-generation detectors (Cosmic Explorer,
 Einstein Telescope), following Baral et al. (2023), arXiv:2304.09889 and
-Nishizawa et al. (2009), arXiv:0903.0528, and optionally the motion of the
-geocentre in the Solar System (:mod:`bilby_xG.orbit`).
+Nishizawa et al. (2009), arXiv:0903.0528. The arrival time follows the
+barycentric position of each detector, including the Earth's orbit, relative
+to a chosen center (:mod:`bilby_xG.motion`).
 
 The single, physics-agnostic response method takes an optional
 :class:`~bilby_xG.propagation.Propagation` model. With the default (general
@@ -27,7 +28,7 @@ from bilby.gw.detector.calibration import Recalibrate
 from bilby.gw.detector.interferometer import Interferometer as _Interferometer
 
 from .geometry import InterferometerGeometry
-from .orbit import orbital_time_delay
+from .motion import geocentre_delay as _geocentre_delay, resolve_center, sky_direction
 from .propagation import Propagation, build_propagation
 from .utils import calculate_time_to_merger_for_any_mode
 
@@ -309,7 +310,7 @@ class Interferometer(_Interferometer):
             times_to_coalescence, propagation=None,
             earth_rotation_time_delay=True, earth_rotation_beam_patterns=True,
             finite_size=True, wave_frame=None, orbital_motion=True,
-            orbital_delay=None):
+            center=None, geocentre_delay=None):
         """Frequency-dependent plus/cross antenna response.
 
         See Nishizawa et al. (2009) arXiv:0903.0528 for the polarisation
@@ -322,7 +323,8 @@ class Interferometer(_Interferometer):
         ra, dec: float
             Source right ascension and declination (radians).
         time: float
-            Geocentric coalescence time (GPS seconds).
+            Coalescence time at the center (GPS seconds); with the default
+            center, at the geocentre.
         psi: float
             Polarisation angle (radians).
         frequencies: array_like
@@ -341,10 +343,12 @@ class Interferometer(_Interferometer):
             The output of :func:`compute_wave_frame` for these arguments, if already
             computed (e.g. for another detector); computed here otherwise.
         orbital_motion: bool
-            Include the motion of the geocentre in the Solar System, see
-            :mod:`bilby_xG.orbit`.
-        orbital_delay: array_like, optional
-            The output of :func:`bilby_xG.orbit.orbital_time_delay` for these
+            Include the orbital motion of the Earth in the position of the
+            detector, see :mod:`bilby_xG.motion`.
+        center: bilby_xG.motion.Center, optional
+            The point ``time`` refers to; the geocentre by default.
+        geocentre_delay: array_like, optional
+            The output of :func:`bilby_xG.motion.geocentre_delay` for these
             arguments, if already computed; computed here otherwise.
 
         Returns
@@ -354,8 +358,13 @@ class Interferometer(_Interferometer):
 
         Notes
         =====
-        Only the plus and cross modes are computed. The detector-position time
-        delay is incorporated directly in the returned beam patterns.
+        Only the plus and cross modes are computed. The arrival-time delay
+        :math:`-\\hat{n}\\cdot[\\mathbf{R}_d(t_f) - \\mathbf{C}]/c` of the
+        detector at its barycentric position :math:`\\mathbf{R}_d` relative
+        to the center :math:`\\mathbf{C}` is incorporated directly in the
+        returned beam patterns; it is the sum of the rotating-vertex term
+        (from ``omegas``, the source direction in Earth-fixed axes) and the
+        detector-independent :func:`bilby_xG.motion.geocentre_delay`.
         """
         if propagation is None:
             propagation = Propagation()
@@ -397,16 +406,20 @@ class Interferometer(_Interferometer):
             fps = fpxx * self.Dxx - fpyy * self.Dyy
             fcs = fcxx * self.Dxx - fcyy * self.Dyy
 
-        # propagation time-shift factor (group velocity)
-        group_velocity = propagation.group_velocity(frequencies)
-        dts = -np.dot(omegas.T, self.geometry.vertex) / (speed_of_light * group_velocity)
-        ifo_times = time - start_time + dts
-        if not earth_rotation_time_delay:
-            ifo_times = ifo_times[-1]
-        if orbital_motion:
-            if orbital_delay is None:
-                orbital_delay = orbital_time_delay(ra, dec, time, times_to_coalescence)
-            ifo_times = ifo_times + orbital_delay / group_velocity
+        # arrival-time delay at the detector's position, relative to the
+        # center, at the propagation (group) velocity
+        if earth_rotation_time_delay:
+            vertex_distance = omegas.T @ self.geometry.vertex
+        else:
+            # the vertex held at its position at coalescence
+            gmst = greenwich_mean_sidereal_time(time)
+            vertex_distance = sky_direction(ra - gmst, dec) @ self.geometry.vertex
+        if geocentre_delay is None:
+            geocentre_delay = _geocentre_delay(
+                ra, dec, time, times_to_coalescence, center=center,
+                orbital_motion=orbital_motion)
+        delays = geocentre_delay - vertex_distance / speed_of_light
+        ifo_times = time - start_time + delays / propagation.group_velocity(frequencies)
 
         exp_fac = np.exp(-1j * 2. * np.pi * frequencies * ifo_times)
         fps = fps * exp_fac
@@ -416,7 +429,7 @@ class Interferometer(_Interferometer):
     def get_detector_response_for_frequency_dependent_antenna_response(
             self, waveform_polarizations, parameters, start_time, frequencies,
             earth_rotation_time_delay=True, earth_rotation_beam_patterns=True,
-            finite_size=True, shared=None, orbital_motion=True):
+            finite_size=True, shared=None, orbital_motion=True, center=None):
         """Combine waveform polarisations with the frequency-dependent response.
 
         Handles both the standard ``{"plus": ..., "cross": ...}`` polarisation
@@ -429,19 +442,25 @@ class Interferometer(_Interferometer):
 
         ``shared``, if given, is a dict in which the detector-independent
         part of the response (time to coalescence, propagation phase and
-        :func:`compute_wave_frame` and the orbital-motion delay, per
-        azimuthal mode number) is stored, and reused by later calls for other
-        detectors. The caller must pass a fresh dict whenever ``parameters``,
-        ``frequencies`` or the Earth-rotation/orbital-motion options change.
+        :func:`compute_wave_frame` and :func:`bilby_xG.motion.geocentre_delay`,
+        per azimuthal mode number) is stored, and reused by later calls for
+        other detectors. The caller must pass a fresh dict whenever
+        ``parameters``, ``frequencies``, ``center`` or the Earth-rotation/
+        orbital-motion options change.
 
-        ``orbital_motion`` includes the motion of the geocentre in the Solar
-        System (see :mod:`bilby_xG.orbit`); with it, the detector-frame
-        masses are those of the Solar-System-barycentre frame.
+        The arrival time follows the barycentric position of the detector
+        (see :mod:`bilby_xG.motion`): ``orbital_motion`` includes the Earth's
+        orbit in it (the detector-frame masses are then those of the
+        Solar-System-barycentre frame), and ``parameters['geocent_time']`` is
+        the arrival time at ``center`` (a :class:`bilby_xG.motion.Center`, or
+        anything :func:`bilby_xG.motion.resolve_center` accepts; the
+        geocentre by default).
 
         Note: the calibration model is not applied here; only plus and cross
         modes are used.
         """
         propagation = build_propagation(parameters)
+        center = resolve_center(center, [self])
         if shared is None:
             shared = {}
         earth_rotation = earth_rotation_time_delay or earth_rotation_beam_patterns
@@ -459,11 +478,11 @@ class Interferometer(_Interferometer):
                         parameters['geocent_time'], parameters['psi'],
                         frequencies, times_to_coalescence,
                         earth_rotation=earth_rotation),
-                    orbital_time_delay(
+                    _geocentre_delay(
                         parameters['ra'], parameters['dec'],
-                        parameters['geocent_time'], times_to_coalescence)
-                    if orbital_motion else None)
-            times_to_coalescence, correction_factor, frame, orbital_delay = shared[mode]
+                        parameters['geocent_time'], times_to_coalescence,
+                        center=center, orbital_motion=orbital_motion))
+            times_to_coalescence, correction_factor, frame, geocentre_delay = shared[mode]
             fps, fcs = self.frequency_dependent_antenna_response(
                 parameters['ra'], parameters['dec'], parameters['geocent_time'],
                 parameters['psi'],
@@ -476,7 +495,8 @@ class Interferometer(_Interferometer):
                 earth_rotation_beam_patterns=earth_rotation_beam_patterns,
                 wave_frame=frame,
                 orbital_motion=orbital_motion,
-                orbital_delay=orbital_delay,
+                center=center,
+                geocentre_delay=geocentre_delay,
             )
             return correction_factor * (
                 polarizations['plus'] * fps + polarizations['cross'] * fcs)

@@ -68,7 +68,7 @@ def test_gr_reduction_matches_standard(setup):
     nextgen = GravitationalWaveTransientNextGeneration(
         interferometers=ifos, waveform_generator=wfg,
         earth_rotation_beam_patterns=False, earth_rotation_time_delay=False,
-        finite_size=False,
+        finite_size=False, orbital_motion=False,
     )
     standard.parameters.update(INJECTION)
     nextgen.parameters.update(INJECTION)
@@ -95,3 +95,25 @@ def test_vG_unity_matches_gr(setup):
     nextgen.parameters.update(dict(vG=1.0))
     logl_vg1 = nextgen.log_likelihood_ratio()
     assert logl_vg1 == pytest.approx(logl_gr, rel=1e-10)
+
+
+def test_center_relabels_the_time(setup):
+    """With a detector as the center, the time parameter is the arrival
+    time there: the likelihood at the injection's arrival time at H1 is the
+    geocentre likelihood at its geocentre time."""
+    ifos, wfg = setup
+    geocentre = GravitationalWaveTransientNextGeneration(
+        interferometers=ifos, waveform_generator=wfg)
+    at_h1 = GravitationalWaveTransientNextGeneration(
+        interferometers=ifos, waveform_generator=wfg, center="H1")
+    assert at_h1.center.label == "H1"
+    t_h1 = INJECTION["geocent_time"] + ifos[0].time_delay_from_geocenter(
+        INJECTION["ra"], INJECTION["dec"], INJECTION["geocent_time"])
+    geocentre.parameters.update(INJECTION)
+    at_h1.parameters.update(dict(INJECTION, geocent_time=t_h1))
+    # to the ~1e-4 * (t_H1 - t_geo) ~ us by which the center moves, as it
+    # is taken at the sampled time
+    assert at_h1.log_likelihood_ratio() == pytest.approx(
+        geocentre.log_likelihood_ratio(), rel=1e-5)
+    at_h1.parameters.update(INJECTION)
+    assert abs(at_h1.log_likelihood_ratio() - geocentre.log_likelihood_ratio()) > 1

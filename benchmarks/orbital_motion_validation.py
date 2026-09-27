@@ -1,4 +1,4 @@
-"""Validation of the cached (interpolated) Earth ephemeris of bilby_xG.orbit.
+"""Validation of the cached (interpolated) Earth ephemeris of bilby_xG.motion.
 
 The analogue of the ephemeris-caching validation of the LGWA response
 (``lgwa_response.lunar_coordinates.make_position_interpolation_plot``), for
@@ -6,7 +6,7 @@ the barycentric motion of the geocentre. The exact reference is the ERFA
 ``epv00`` series itself, evaluated at random times over 2030-2040; the
 cached ephemeris interpolates nodes spaced by ``step``, either linearly in
 position (as the LGWA cache does) or by cubic Hermite interpolation of
-positions and velocities (as :class:`bilby_xG.orbit.EarthEphemeris` does).
+positions and velocities (as :class:`bilby_xG.motion.EarthEphemeris` does).
 
 The position error is converted to the phase error it causes at 2 kHz,
 roughly the highest frequency of a BNS signal in a ground-based detector
@@ -23,11 +23,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from bilby.core.utils import speed_of_light
 
-from bilby_xG.orbit import (
+from bilby_xG.motion import (
     EarthEphemeris,
     earth_barycentric_position_velocity,
     hermite_interpolate,
-    orbital_time_delay,
+    geocentre_delay,
 )
 
 GPS_2030, GPS_2040 = 1577491218.0, 1893024018.0
@@ -99,8 +99,8 @@ def relative_delay_errors(steps, n=300, duration=86400.0, seed=2):
         for _ in range(n):
             tc = rng.uniform(GPS_2030, GPS_2040)
             ra, dec = rng.uniform(0, 2 * np.pi), np.arcsin(rng.uniform(-1, 1))
-            cached = orbital_time_delay(ra, dec, tc, ttc, ephemeris=ephemeris)
-            exact = orbital_time_delay(ra, dec, tc, ttc, ephemeris=_Exact())
+            cached = geocentre_delay(ra, dec, tc, ttc, ephemeris=ephemeris)
+            exact = geocentre_delay(ra, dec, tc, ttc, ephemeris=_Exact())
             errors.append(np.abs(cached - exact).max())
         out.append(errors)
     return np.array(out)
@@ -145,10 +145,10 @@ def main(outdir="orbital_motion_figures"):
     # cost of one evaluation at 1000 frequencies (bin edges), cached
     ephemeris = EarthEphemeris()
     ttc = np.geomspace(1e-3, 3e4, 1000)
-    orbital_time_delay(1.0, 0.2, 1.9e9, ttc, ephemeris=ephemeris)
+    geocentre_delay(1.0, 0.2, 1.9e9, ttc, ephemeris=ephemeris)
     start = time.perf_counter()
     for _ in range(1000):
-        orbital_time_delay(1.0, 0.2, 1.9e9, ttc, ephemeris=ephemeris)
+        geocentre_delay(1.0, 0.2, 1.9e9, ttc, ephemeris=ephemeris)
     per_call = (time.perf_counter() - start) / 1000
     start = time.perf_counter()
     earth_barycentric_position_velocity(1.9e9 - ttc)
