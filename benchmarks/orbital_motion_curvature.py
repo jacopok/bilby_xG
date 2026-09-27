@@ -303,11 +303,12 @@ def fmin_figure(samples, outdir, minimum_frequencies=(2, 3, 4, 5, 7, 10, 15)):
             network = Network(names, minimum_frequency=f_min)
             values.append([analyse(network, *s)["mismatch"][1] for s in samples])
         values = np.array(values).T
-        band(ax, f_mins, values, color, name)
+        band(ax, f_mins, values, color, name.split(" (")[0])
         summary[name] = dict(zip(map(str, f_mins), np.median(values, axis=0).tolist()))
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xticks(minimum_frequencies, [str(f) for f in minimum_frequencies])
+    ax.xaxis.set_minor_formatter(plt.NullFormatter())
     ax.set_xlabel("Minimum frequency [Hz]")
     ax.set_ylabel("Mismatch to the optimal Doppler shift")
     ax.grid(True, which="major", alpha=0.3)
