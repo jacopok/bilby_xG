@@ -24,7 +24,8 @@ rounding of its kernel-ridge regressors (see :mod:`mlgw_bns.batched`); see
 differences and the speed-up.
 
 :class:`BatchedBilbyModel` and :class:`BatchedNessai` connect it to nessai:
-pass ``sampler=BatchedNessai`` to :func:`bilby.run_sampler`.
+pass ``sampler="batched_nessai"`` to :func:`bilby.run_sampler` (a
+``bilby.samplers`` entry point).
 """
 import math
 
@@ -350,8 +351,13 @@ def _batched_nessai_class():
         class BatchedNessai(plugin.Nessai):
             """bilby's nessai sampler, with the likelihood evaluated on whole
             batches of points: ``bilby.run_sampler(likelihood=
-            BatchedRelativeBinningLikelihood(...), sampler=BatchedNessai, ...)``.
+            BatchedRelativeBinningLikelihood(...), sampler="batched_nessai",
+            ...)``.
             """
+
+            # bilby checks the install by importing this name, which
+            # otherwise defaults to the lower-cased class name
+            external_sampler_name = "nessai"
 
             def run_sampler(self):
                 originals = plugin.BilbyModel, plugin.BilbyModelLikelihoodConstraint

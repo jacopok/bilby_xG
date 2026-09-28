@@ -43,6 +43,9 @@ test = ["pytest", "pytest-cov"]
 Homepage = "https://git.ligo.org/pratyusava.baral/bilby_xG"
 Source = "https://git.ligo.org/pratyusava.baral/bilby_xG"
 
+[project.entry-points."bilby.samplers"]
+batched_nessai = "bilby_xG.batched:BatchedNessai"
+
 [tool.setuptools.packages.find]
 include = ["bilby_xG*"]
 
