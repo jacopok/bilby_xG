@@ -36,7 +36,7 @@ from bilby.core.likelihood import Likelihood
 from bilby.core.utils import logger, speed_of_light
 from bilby_cython.geometry import greenwich_mean_sidereal_time
 
-from .motion import default_ephemeris, hermite_interpolate, precession_matrix
+from .motion import default_ephemeris, hermite_interpolate, precession_matrix, resolve_center
 from .utils import calculate_time_to_merger_for_any_mode
 
 __author__ = ["Jacopo Tissino"]
@@ -217,7 +217,7 @@ class BatchedRelativeBinningLikelihood(Likelihood):
         self._flags = (bool(likelihood.earth_rotation_time_delay),
                        bool(likelihood.earth_rotation_beam_patterns),
                        bool(likelihood.finite_size))
-        self._orbital_motion = bool(getattr(likelihood, "orbital_motion", False))
+        self._orbital_motion = bool(likelihood.orbital_motion)
         # the ephemeris over the data segment, and a day either side
         table = default_ephemeris.table(self.start_time - _DAY,
                                         self.start_time + ifos.duration + _DAY)
@@ -225,7 +225,7 @@ class BatchedRelativeBinningLikelihood(Likelihood):
             t0=np.float64(table["t0"]), positions=table["positions"],
             velocities=table["velocities"], precession=precession_matrix(self.start_time))
         self._orbit_step = table["step"]
-        center = likelihood.center
+        center = resolve_center(likelihood.center, ifos)
         if center.fixed_position is None and center.reference_time is None:
             self._arrays["center"] = dict(offset=center.offset)
         else:

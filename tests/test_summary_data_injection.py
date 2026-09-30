@@ -125,3 +125,25 @@ def test_refuses_what_needs_the_full_data():
         Likelihood(interferometers=InterferometerList(["ET-EMR"]), waveform_generator=wfg,
                    fiducial_parameters=INJECTION, time_marginalization=True,
                    priors=bilby.gw.prior.BBHPriorDict(), injection=injection)
+
+
+def test_likelihood_pickled_before_the_motion():
+    """A likelihood pickled, after an evaluation, before orbital_motion and
+    center existed evaluates as one without the orbital motion; the
+    per-evaluation response cache is not pickled."""
+    import pickle
+
+    wfg = _waveform_generator()
+    injection = SummaryDataInjection(wfg, INJECTION, START_TIME, FMIN, FMAX, noise=False,
+                                     orbital_motion=False)
+    likelihood = Likelihood(
+        interferometers=InterferometerList(["ET-EMR"]), waveform_generator=wfg,
+        fiducial_parameters=INJECTION, epsilon=0.05, time_reference="geocent",
+        injection=injection, orbital_motion=False)
+    expected = [_log_likelihood_ratio(likelihood, p) for p in (OTHER, INJECTION)]
+    assert likelihood._shared_response_cache is not None
+    old = pickle.loads(pickle.dumps(likelihood))
+    assert "_shared_response_cache" not in vars(old)
+    del old.orbital_motion, old.center
+    old = pickle.loads(pickle.dumps(old))
+    assert [_log_likelihood_ratio(old, p) for p in (INJECTION, OTHER)] == expected[::-1]

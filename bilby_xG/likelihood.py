@@ -170,6 +170,11 @@ class GravitationalWaveTransientNextGeneration(GravitationalWaveTransient):
         the detectors). See :func:`bilby_xG.motion.resolve_center`.
     """
 
+    # Fallbacks for instances pickled before the detector motion was added:
+    # their data were built without the orbital motion, about the geocentre.
+    orbital_motion = False
+    center = None
+
     def __init__(self, interferometers, waveform_generator, time_marginalization=False,
                  distance_marginalization=False, phase_marginalization=False,
                  calibration_marginalization=False, priors=None,
@@ -273,6 +278,11 @@ class MBGravitationalWaveTransientNextGeneration(MBGravitationalWaveTransient):
         this release: only the default (``None``, update at every evaluation) is
         supported. Passing a value raises :class:`NotImplementedError`.
     """
+
+    # Fallbacks for instances pickled before the detector motion was added:
+    # their data were built without the orbital motion, about the geocentre.
+    orbital_motion = False
+    center = None
 
     def __init__(
         self, interferometers, waveform_generator, reference_chirp_mass, highest_mode=2,
@@ -478,6 +488,11 @@ class RelativeBinningGravitationalWaveTransientNextGeneration(RelativeBinningGra
     -----
     The relative binning likelihood does not currently support calibration marginalization.
     """
+
+    # Fallbacks for instances pickled before the detector motion was added:
+    # their data were built without the orbital motion, about the geocentre.
+    orbital_motion = False
+    center = None
 
     def __init__(
             self, interferometers,
@@ -715,6 +730,11 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
     -----
     The relative binning likelihood does not currently support calibration marginalization.
     """
+
+    # Fallbacks for instances pickled before the detector motion was added:
+    # their data were built without the orbital motion, about the geocentre.
+    orbital_motion = False
+    center = None
 
     def __init__(self, interferometers,
                  waveform_generator,
@@ -1576,6 +1596,17 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             cache = (key, self.bin_freqs, {})
             self._shared_response_cache = cache
         return cache[2]
+
+    def __getstate__(self):
+        # the shared-response cache is per evaluation, and its layout may
+        # change between versions
+        state = self.__dict__.copy()
+        state.pop("_shared_response_cache", None)
+        return state
+
+    def __setstate__(self, state):
+        state.pop("_shared_response_cache", None)
+        self.__dict__.update(state)
 
     def compute_waveform_ratio_per_interferometer(self, waveform_polarizations, interferometer, parameters=None):
         name = interferometer.name

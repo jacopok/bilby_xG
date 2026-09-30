@@ -75,6 +75,11 @@ class SummaryDataInjection:
         Interferometer names are resolved in :meth:`setup_interferometers`.
     """
 
+    # Fallbacks for instances pickled before the detector motion was added:
+    # their data were built without the orbital motion, about the geocentre.
+    orbital_motion = False
+    center = None
+
     def __init__(self, waveform_generator, parameters, start_time,
                  minimum_frequency, maximum_frequency, noise=True, seed=None,
                  earth_rotation_time_delay=True, earth_rotation_beam_patterns=True,

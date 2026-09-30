@@ -117,3 +117,19 @@ def test_center_relabels_the_time(setup):
         geocentre.log_likelihood_ratio(), rel=1e-5)
     at_h1.parameters.update(INJECTION)
     assert abs(at_h1.log_likelihood_ratio() - geocentre.log_likelihood_ratio()) > 1
+
+
+def test_likelihood_pickled_before_the_motion(setup):
+    """A likelihood pickled before orbital_motion and center existed
+    evaluates as one without the orbital motion, about the geocentre."""
+    import pickle
+
+    ifos, wfg = setup
+    old = GravitationalWaveTransientNextGeneration(interferometers=ifos, waveform_generator=wfg)
+    del old.orbital_motion, old.center
+    old = pickle.loads(pickle.dumps(old))
+    without = GravitationalWaveTransientNextGeneration(
+        interferometers=ifos, waveform_generator=wfg, orbital_motion=False)
+    old.parameters.update(INJECTION)
+    without.parameters.update(INJECTION)
+    assert old.log_likelihood_ratio() == without.log_likelihood_ratio()
