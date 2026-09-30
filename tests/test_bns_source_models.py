@@ -43,7 +43,7 @@ def test_mlgw_bns_modes_match_the_surrogate():
         mass_ratio=1 / params["q"], lambda_1=params["LambdaAl2"],
         lambda_2=params["LambdaBl2"], chi_1=params["chi1z"], chi_2=params["chi2z"],
         distance_mpc=params["distance"], inclination=params["inclination"],
-        total_mass=params["M"], reference_phase=0.0, time_shift=0.0))
+        total_mass=params["M"], coalescence_phase=0.0, merger_time=0.0))
     for key, pols in modes.items():
         ell, emm = (int(part) for part in key.split(","))
         # mlgw_bns' batched evaluation reproduces predict_modes_dict to the

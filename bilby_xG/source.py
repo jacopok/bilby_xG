@@ -1797,6 +1797,12 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
     full-grid and the relative-binning likelihoods, and chunked injections),
     otherwise on ``frequency_array``. ``mode_array`` selects a subset of
     :data:`MLGW_BNS_MODES`. Non-positive frequencies are zero.
+
+    The surrogate is referenced to the merger (mlgw_bns after 1.0): the
+    merger is at the reference time (``geocent_time``), and
+    ``coalescence_angle`` is the orbital phase there. The merger is where
+    the frequency-domain phase of the (2,2) mode becomes linear, within a
+    few ``M`` of the peak of the TEOBResumS amplitude.
     """
     from mlgw_bns.batched import mode_polarizations
 
