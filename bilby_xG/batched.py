@@ -18,7 +18,9 @@ contraction.
 
 Scope of the prototype: general relativity only (no ``vG`` / ``(a, A)``),
 no distance/phase/time marginalisation, ``reference_frame="sky"`` with
-geocentre time. The JAX surrogate agrees with the numpy one only to the
+geocentre time. The detector motion (:mod:`bilby_xG.motion`) is evaluated on
+the ephemeris tabulated over the data segment, in the axes of date at its
+start. The JAX surrogate agrees with the numpy one only to the
 rounding of its kernel-ridge regressors (see :mod:`mlgw_bns.batched`); see
 ``benchmarks/et_mlgw_bns_batched.py`` for the resulting log-likelihood
 differences and the speed-up.
@@ -34,6 +36,7 @@ from bilby.core.likelihood import Likelihood
 from bilby.core.utils import logger, speed_of_light
 from bilby_cython.geometry import greenwich_mean_sidereal_time
 
+from .motion import default_ephemeris, hermite_interpolate, precession_matrix
 from .utils import calculate_time_to_merger_for_any_mode
 
 __author__ = ["Jacopo Tissino"]
@@ -66,9 +69,12 @@ def mlgw_bns_jax_modes(model, mode_array):
     return modes
 
 
-def _antenna_response(geometry, frame, frequencies, ifo_time, flags):
+def _antenna_response(geometry, frame, frequencies, ifo_time, flags, geocentre_delay,
+                      direction_at_coalescence):
     """``Interferometer.frequency_dependent_antenna_response`` (general
-    relativity) in JAX, for one detector, given the wave frame."""
+    relativity) in JAX, for one detector, given the wave frame, the
+    detector-independent delay and the source direction in Earth-fixed axes
+    at coalescence."""
     import jax.numpy as jnp
 
     earth_rotation_time_delay, earth_rotation_beam_patterns, finite_size = flags
@@ -96,11 +102,37 @@ def _antenna_response(geometry, frame, frequencies, ifo_time, flags):
         fps = constant(jnp.einsum('ij,ijk->k', geometry["detector_tensor"], pol_plus))
         fcs = constant(jnp.einsum('ij,ijk->k', geometry["detector_tensor"], pol_cross))
 
-    ifo_times = ifo_time - omegas.T @ geometry["vertex"] / speed_of_light
-    if not earth_rotation_time_delay:
-        ifo_times = ifo_times[-1]
+    if earth_rotation_time_delay:
+        vertex_distance = omegas.T @ geometry["vertex"]
+    else:
+        vertex_distance = direction_at_coalescence @ geometry["vertex"]
+    ifo_times = ifo_time + geocentre_delay - vertex_distance / speed_of_light
     exp_fac = jnp.exp(-2j * math.pi * frequencies * ifo_times)
     return fps * exp_fac, fcs * exp_fac
+
+
+def _geocentre_delay(ra, dec, geocent_time, gmst, times_to_coalescence, orbit, center,
+                     orbital_motion):
+    """:func:`bilby_xG.motion.geocentre_delay` in JAX, on the node table
+    ``orbit`` (see :meth:`bilby_xG.motion.EarthEphemeris.table`, with its
+    ``precession`` matrix). ``center`` is a dict with either ``offset``
+    (Earth-fixed, at coalescence) or ``position`` (fixed, axes of date)."""
+    import jax.numpy as jnp
+
+    direction = jnp.stack([jnp.cos(dec) * jnp.cos(ra), jnp.cos(dec) * jnp.sin(ra), jnp.sin(dec)])
+    icrs_direction = orbit["precession"].T @ direction
+    times = geocent_time - times_to_coalescence if orbital_motion else geocent_time[None]
+    times = jnp.append(times, geocent_time)
+    distances = hermite_interpolate(times, orbit["t0"], orbit["step"], orbit["positions"],
+                                    orbit["velocities"], xp=jnp) @ icrs_direction
+    if "offset" in center:
+        earth_fixed = jnp.stack([jnp.cos(dec) * jnp.cos(ra - gmst),
+                                 jnp.cos(dec) * jnp.sin(ra - gmst), jnp.sin(dec)])
+        center_distance = distances[-1] + earth_fixed @ center["offset"]
+    else:
+        center_distance = direction @ center["position"]
+    delay = -(distances[:-1] - center_distance) / speed_of_light
+    return delay if orbital_motion else jnp.full_like(times_to_coalescence, delay[0])
 
 
 def _wave_frame(ra, dec, psi, gmsts):
@@ -185,6 +217,19 @@ class BatchedRelativeBinningLikelihood(Likelihood):
         self._flags = (bool(likelihood.earth_rotation_time_delay),
                        bool(likelihood.earth_rotation_beam_patterns),
                        bool(likelihood.finite_size))
+        self._orbital_motion = bool(getattr(likelihood, "orbital_motion", False))
+        # the ephemeris over the data segment, and a day either side
+        table = default_ephemeris.table(self.start_time - _DAY,
+                                        self.start_time + ifos.duration + _DAY)
+        self._arrays["orbit"] = dict(
+            t0=np.float64(table["t0"]), positions=table["positions"],
+            velocities=table["velocities"], precession=precession_matrix(self.start_time))
+        self._orbit_step = table["step"]
+        center = likelihood.center
+        if center.fixed_position is None and center.reference_time is None:
+            self._arrays["center"] = dict(offset=center.offset)
+        else:
+            self._arrays["center"] = dict(position=center.position(self.start_time))
         self._modes = mlgw_bns_jax_modes(_mlgw_bns_model(), self.mode_array)
         self._batched = jax.jit(self._batch)
 
@@ -218,8 +263,16 @@ class BatchedRelativeBinningLikelihood(Likelihood):
                         f, p["mass_1"], p["mass_2"], p["chi_1"], p["chi_2"], mode=emm, safety=1)
                     gmsts = (p["gmst"] - p["gmst_rate"] * ttc if earth_rotation
                              else jnp.full_like(f, p["gmst"]))
-                    frames[emm] = _wave_frame(p["ra"], p["dec"], p["psi"], gmsts)
-                fps, fcs = _antenna_response(geometry, frames[emm], f, ifo_time, self._flags)
+                    frames[emm] = (_wave_frame(p["ra"], p["dec"], p["psi"], gmsts),
+                                   _geocentre_delay(
+                                       p["ra"], p["dec"], p["geocent_time"], p["gmst"], ttc,
+                                       dict(arrays["orbit"], step=self._orbit_step),
+                                       arrays["center"], self._orbital_motion))
+                direction = jnp.stack([
+                    jnp.cos(p["dec"]) * jnp.cos(p["ra"] - p["gmst"]),
+                    jnp.cos(p["dec"]) * jnp.sin(p["ra"] - p["gmst"]), jnp.sin(p["dec"])])
+                fps, fcs = _antenna_response(geometry, frames[emm][0], f, ifo_time, self._flags,
+                                             frames[emm][1], direction)
                 strains.append(plus[k] * fps + cross[k] * fcs)
             ratios.append(jnp.stack(strains))
         ratio = jnp.stack(ratios) / arrays["reference"]  # (ifo, mode, edge)

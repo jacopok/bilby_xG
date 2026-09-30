@@ -27,6 +27,7 @@ import numpy as np
 from bilby.core.utils import logger
 from bilby.gw.utils import noise_weighted_inner_product
 from bilby.core.series import CoupledTimeAndFrequencySeries
+from .motion import resolve_center
 
 #: Frequency samples per chunk; the same default as the relative-binning
 #: likelihood's ``summary_data_chunk_size``.
@@ -66,14 +67,18 @@ class SummaryDataInjection:
     seed : int, optional
         Seed of the noise realisation; drawn at random if not given (the
         drawn seed is logged and kept as ``self.seed``).
-    earth_rotation_time_delay, earth_rotation_beam_patterns, finite_size : bool
+    earth_rotation_time_delay, earth_rotation_beam_patterns, finite_size, orbital_motion : bool
         Detector-response options for the injected signal.
+    center : str, array_like or bilby_xG.motion.Center, optional
+        The point ``geocent_time`` refers to (see
+        :func:`bilby_xG.motion.resolve_center`); the geocentre by default.
+        Interferometer names are resolved in :meth:`setup_interferometers`.
     """
 
     def __init__(self, waveform_generator, parameters, start_time,
                  minimum_frequency, maximum_frequency, noise=True, seed=None,
                  earth_rotation_time_delay=True, earth_rotation_beam_patterns=True,
-                 finite_size=True):
+                 finite_size=True, orbital_motion=True, center=None):
         self.waveform_generator = waveform_generator
         self.parameters = dict(parameters)
         self.start_time = start_time
@@ -84,6 +89,8 @@ class SummaryDataInjection:
         self.earth_rotation_time_delay = bool(earth_rotation_time_delay)
         self.earth_rotation_beam_patterns = bool(earth_rotation_beam_patterns)
         self.finite_size = bool(finite_size)
+        self.orbital_motion = bool(orbital_motion)
+        self.center = center
         converted, _ = waveform_generator.parameter_conversion(
             dict(parameters, fiducial=0))
         self.converted_parameters = converted
@@ -98,6 +105,7 @@ class SummaryDataInjection:
         """Give the interferometers the data's time/frequency grid and band,
         without any strain array."""
         wfg = self.waveform_generator
+        self.center = resolve_center(self.center, interferometers)
         for ifo in interferometers:
             ifo.strain_data._frequency_domain_strain = None
             ifo.strain_data._time_domain_strain = None
@@ -117,7 +125,8 @@ class SummaryDataInjection:
                 [interferometer], self.waveform_generator, self.source_parameters,
                 self.converted_parameters, frequencies[keep], self.start_time,
                 self.earth_rotation_time_delay, self.earth_rotation_beam_patterns,
-                self.finite_size)[0]
+                self.finite_size, self.orbital_motion,
+                resolve_center(self.center, [interferometer]))[0]
         return out
 
     def noise_generator(self, interferometer):
@@ -158,7 +167,7 @@ def _band(waveform_generator, minimum_frequency, maximum_frequency):
 def _detector_signal(interferometers, waveform_generator, source_parameters,
                      converted_parameters, frequencies, start_time,
                      earth_rotation_time_delay, earth_rotation_beam_patterns,
-                     finite_size):
+                     finite_size, orbital_motion=True, center=None):
     polarizations = waveform_generator.frequency_domain_source_model(
         frequencies, **source_parameters,
         **dict(waveform_generator.waveform_arguments, frequency_bin_edges=frequencies))
@@ -167,7 +176,8 @@ def _detector_signal(interferometers, waveform_generator, source_parameters,
         start_time=start_time, frequencies=frequencies,
         earth_rotation_time_delay=earth_rotation_time_delay,
         earth_rotation_beam_patterns=earth_rotation_beam_patterns,
-        finite_size=finite_size) for ifo in interferometers]
+        finite_size=finite_size, orbital_motion=orbital_motion, center=center)
+        for ifo in interferometers]
 
 
 def inject_zero_noise_chunked(interferometers, waveform_generator, parameters,
@@ -175,7 +185,8 @@ def inject_zero_noise_chunked(interferometers, waveform_generator, parameters,
                               chunk_size=DEFAULT_CHUNK_SIZE,
                               earth_rotation_time_delay=True,
                               earth_rotation_beam_patterns=True,
-                              finite_size=True, progress=True):
+                              finite_size=True, progress=True,
+                              orbital_motion=True, center=None):
     """Set each interferometer's strain to the noiseless signal.
 
     Only needed when the full data are; otherwise use
@@ -202,6 +213,7 @@ def inject_zero_noise_chunked(interferometers, waveform_generator, parameters,
     float
         The network optimal SNR.
     """
+    center = resolve_center(center, interferometers)
     frequency_array = waveform_generator.frequency_array
     df = frequency_array[1] - frequency_array[0]
     positions = np.flatnonzero(frequency_array > minimum_frequency - df)
@@ -224,7 +236,8 @@ def inject_zero_noise_chunked(interferometers, waveform_generator, parameters,
         responses = _detector_signal(
             interferometers, waveform_generator, source_parameters, converted,
             frequency_array[idx], start_time, bool(earth_rotation_time_delay),
-            bool(earth_rotation_beam_patterns), bool(finite_size))
+            bool(earth_rotation_beam_patterns), bool(finite_size),
+            bool(orbital_motion), center)
         for ifo, response in zip(interferometers, responses):
             strain[ifo.name][idx] = response
 

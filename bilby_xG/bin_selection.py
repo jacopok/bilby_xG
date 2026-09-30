@@ -41,6 +41,8 @@ import numpy as np
 from bilby.core.utils import logger
 from scipy.optimize import minimize_scalar
 
+from .motion import resolve_center
+
 CHUNK_SIZE = 250_000
 
 
@@ -58,7 +60,8 @@ class Projector:
     relative-binning likelihood evaluates its fiducial waveform)."""
 
     def __init__(self, interferometers, waveform_generator, earth_rotation_time_delay=True,
-                 earth_rotation_beam_patterns=True, finite_size=True):
+                 earth_rotation_beam_patterns=True, finite_size=True, orbital_motion=True,
+                 center=None):
         self.interferometers = interferometers
         self.waveform_generator = waveform_generator
         self.mode_keys = [f"{l},{m}" for l, m in waveform_generator.waveform_arguments["mode_array"]]
@@ -66,7 +69,9 @@ class Projector:
         self.response_kwargs = dict(
             earth_rotation_time_delay=bool(earth_rotation_time_delay),
             earth_rotation_beam_patterns=bool(earth_rotation_beam_patterns),
-            finite_size=bool(finite_size))
+            finite_size=bool(finite_size),
+            orbital_motion=bool(orbital_motion),
+            center=resolve_center(center, interferometers))
 
     def convert(self, parameters):
         parameters = dict(parameters, fiducial=1)
@@ -337,7 +342,7 @@ def select_relative_binning_bins(
         target_mismatch=0.1, n_grid=30_001, n_scan_draws=4,
         scan_betas=np.geomspace(1e-8, 1, 17), comparison_bins=None,
         earth_rotation_time_delay=True, earth_rotation_beam_patterns=True, finite_size=True,
-        npool=1, outdir=None):
+        npool=1, outdir=None, orbital_motion=True, center=None):
     """Select relative-binning bin edges for the mode-by-mode likelihood.
 
     Parameters
@@ -382,7 +387,7 @@ def select_relative_binning_bins(
     global _FINDER
     t_start = time.time()
     projector = Projector(interferometers, waveform_generator, earth_rotation_time_delay,
-                          earth_rotation_beam_patterns, finite_size)
+                          earth_rotation_beam_patterns, finite_size, orbital_motion, center)
     f_max = min(maximum_frequency, projector.maximum_frequency(
         fiducial_parameters, minimum_frequency, maximum_frequency))
     freqs = np.geomspace(minimum_frequency, f_max, n_grid)
