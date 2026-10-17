@@ -95,3 +95,27 @@ def test_lal_time_to_merger():
     late = np.linspace(3000.0, 3100.0, 11)
     out = modes(late, "IMRPhenomXPHM", time_to_merger=True)
     assert np.all(out["1"]["time_to_merger"] == 0)
+
+
+def test_sequence_above_the_cutoff_is_zero():
+    """A sequence wholly above the end of the waveform (a summary-data chunk
+    of a heavy binary) is zero, where LAL raises; across the end it is the
+    full sequence's values."""
+    from bilby_xG.source import binary_black_hole_individual_modes_frequency_sequence
+
+    def modes(frequencies):
+        return binary_black_hole_individual_modes_frequency_sequence(
+            frequencies, 36.0, 29.0, 1000.0, 0.6, 1.0, 1.5, 0.4, 2.0, 0.8, 0.8, 1.3,
+            frequencies=frequencies, waveform_approximant="IMRPhenomXPHM",
+            mode_array=[[2, 2], [2, -2], [4, 4], [4, -4]], reference_frequency=20.0)
+
+    # IMRPhenomXPHM stops at Mf = 0.3, ~940 Hz
+    full = np.linspace(500.0, 1600.0, 1101)
+    late = full >= 1200.0
+    out_full, out_late = modes(full), modes(full[late])
+    for key, value in out_late.items():
+        for polarisation in ("plus", "cross"):
+            assert np.all(value[polarisation] == 0)
+            np.testing.assert_array_equal(out_full[key][polarisation][late],
+                                          value[polarisation])
+    assert np.any(out_full["2"]["plus"] != 0)

@@ -1314,6 +1314,34 @@ def binary_neutron_star_frequency_sequence(
         phi_12=phi_12, lambda_1=lambda_1, lambda_2=lambda_2, **waveform_kwargs)
 
 
+def _fd_waveform_sequence(phase, mass_1, mass_2, spin_1x, spin_1y, spin_1z,
+                          spin_2x, spin_2y, spin_2z, reference_frequency,
+                          luminosity_distance, iota, waveform_dictionary,
+                          approximant, frequencies):
+    """LAL's frequency-domain polarisations on ``frequencies``, as arrays.
+
+    A sequence entirely above the model's cutoff (a summary-data chunk of a
+    heavy binary: IMRPhenomX stops at Mf = 0.3) is a domain error for LAL;
+    it is evaluated started at the reference frequency instead, where the
+    model is zero. The model's values do not depend on where the sequence
+    starts.
+    """
+    def sequence(frequencies):
+        h_plus, h_cross = lalsim_SimInspiralChooseFDWaveformSequence(
+            phase, mass_1, mass_2, spin_1x, spin_1y, spin_1z, spin_2x, spin_2y,
+            spin_2z, reference_frequency, luminosity_distance, iota,
+            waveform_dictionary, approximant, frequencies)
+        return h_plus.data.data, h_cross.data.data
+
+    try:
+        return sequence(frequencies)
+    except RuntimeError:
+        if not len(frequencies) or frequencies[0] <= reference_frequency:
+            raise
+    h_plus, h_cross = sequence(np.concatenate([[reference_frequency], frequencies]))
+    return h_plus[1:], h_cross[1:]
+
+
 def _base_waveform_frequency_sequence(
         frequency_array, mass_1, mass_2, luminosity_distance, a_1, tilt_1,
         phi_12, a_2, tilt_2, lambda_1, lambda_2, phi_jl, theta_jn, phase,
@@ -1407,7 +1435,7 @@ def _base_waveform_frequency_sequence(
         reference_frequency=reference_frequency, phase=phase)
 
     try:
-        h_plus, h_cross = lalsim_SimInspiralChooseFDWaveformSequence(
+        h_plus, h_cross = _fd_waveform_sequence(
             phase, mass_1, mass_2, spin_1x, spin_1y, spin_1z, spin_2x, spin_2y,
             spin_2z, reference_frequency, luminosity_distance, iota,
             waveform_dictionary, approximant, frequencies)
@@ -1429,7 +1457,7 @@ def _base_waveform_frequency_sequence(
             else:
                 raise
 
-    return dict(plus=h_plus.data.data, cross=h_cross.data.data)
+    return dict(plus=h_plus, cross=h_cross)
 
 
 def _base_waveform_individual_modes_frequency_sequence(
@@ -1538,11 +1566,11 @@ def _base_waveform_individual_modes_frequency_sequence(
                 lalsim.SimInspiralModeArrayActivateMode(mode_array_lal, mode[0], mode[1])
         lalsim.SimInspiralWaveformParamsInsertModeArray(waveform_dictionary, mode_array_lal)
         try:
-            h_plus, h_cross = lalsim_SimInspiralChooseFDWaveformSequence(
+            h_plus, h_cross = _fd_waveform_sequence(
                 phase, mass_1, mass_2, spin_1x, spin_1y, spin_1z, spin_2x, spin_2y,
                 spin_2z, reference_frequency, luminosity_distance, iota,
                 waveform_dictionary, approximant, frequencies)
-            return_dict[str(m_)] = dict(plus=h_plus.data.data, cross=h_cross.data.data)
+            return_dict[str(m_)] = dict(plus=h_plus, cross=h_cross)
         except Exception as e:
             if not catch_waveform_errors:
                 raise
