@@ -228,7 +228,7 @@ def test_truncated_mixture_likelihood(likelihoods):
     truncated = []
     for edge in edges:
         reference = BatchedRelativeBinningLikelihood(numpy_likelihood, batch_size=8)
-        for key in ("a0", "a1", "b0", "b1"):
+        for key in ("a0", "a1", "b0", "b1", "b2"):
             reference._arrays[key] = reference._arrays[key].copy()
             reference._arrays[key][..., edge:] = 0
         truncated.append(reference.log_likelihood_ratio(points))

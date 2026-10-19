@@ -177,3 +177,34 @@ def test_summary_data_centred_on_the_bins():
                                    expected_b1, rtol=1e-8)
     # the two centres do differ for these bins
     assert max(offsets) > 0.1 / DURATION
+
+
+def test_inner_product_is_the_norm_of_the_reconstruction():
+    """With b2, <h|h> is the exact norm of the reconstructed waveform
+    h0 (r0 + r1 (f - f_c)), so never negative and ln L <= <d|d> / 2, even
+    for a template far from the fiducial; without it, it is not."""
+    likelihood = _likelihood(noise=False)
+    ifo = likelihood.interferometers[0]
+    far = dict(INJECTION, mass_1=20.0, mass_2=12.0, theta_jn=2.5)
+    likelihood.parameters.update(far)
+    polarizations = likelihood.waveform_generator.frequency_domain_strain(likelihood.parameters)
+    r0, r1 = likelihood.compute_waveform_ratio_per_interferometer(
+        polarizations, ifo, parameters=dict(likelihood.parameters))
+    frequencies = ifo.frequency_array[ifo.frequency_mask]
+    bin_inds = np.searchsorted(frequencies, likelihood.bin_freqs)
+    psd = ifo.power_spectral_density.get_power_spectral_density_array(frequencies)
+    reconstruction = np.zeros(len(frequencies), dtype=complex)
+    for key in r0:
+        h0 = likelihood._reference_mode(ifo, key, frequencies)
+        for i in range(likelihood.number_of_bins):
+            idxs = slice(bin_inds[i], bin_inds[i + 1])
+            delta = frequencies[idxs] - likelihood.bin_centers[i]
+            reconstruction[idxs] += h0[idxs] * (r0[key][i] + r1[key][i] * delta)
+    expected = noise_weighted_inner_product(reconstruction, reconstruction, psd, DURATION).real
+    optimal = likelihood.calculate_snrs(polarizations, ifo, parameters=dict(likelihood.parameters))
+    np.testing.assert_allclose(optimal.optimal_snr_squared.real, expected, rtol=1e-8)
+    assert _log_likelihood_ratio(likelihood, far) <= _log_likelihood_ratio(likelihood, INJECTION)
+    likelihood.second_order = False
+    first_order = likelihood.calculate_snrs(polarizations, ifo,
+                                            parameters=dict(likelihood.parameters))
+    assert not np.isclose(first_order.optimal_snr_squared.real, expected, rtol=1e-6)

@@ -273,6 +273,8 @@ class BatchedRelativeBinningLikelihood(Likelihood):
                       for ifo in ifos]),
             b1=stack([stack([stack([summary[ifo.name]["b1"][k][kp] for kp in keys]) for k in keys])
                       for ifo in ifos]),
+            b2=stack([stack([stack([likelihood._second_order_summary_data(ifo.name)[k][kp]
+                                    for kp in keys]) for k in keys]) for ifo in ifos]),
             reference=stack([stack([likelihood.per_detector_per_mode_fiducial_waveform_points[
                 ifo.name][k] for k in keys]) for ifo in ifos]),
             bin_widths=np.asarray(likelihood.bin_widths, dtype=float),
@@ -402,7 +404,8 @@ class BatchedRelativeBinningLikelihood(Likelihood):
         h_inner_h = jnp.sum(
             arrays["b0"] * r0[:, :, None] * jnp.conj(r0[:, None, :])
             + arrays["b1"] * (r0[:, :, None] * jnp.conj(r1[:, None, :])
-                              + jnp.conj(r0[:, None, :]) * r1[:, :, None]), axis=(0, 1, 2))
+                              + jnp.conj(r0[:, None, :]) * r1[:, :, None])
+            + arrays["b2"] * r1[:, :, None] * jnp.conj(r1[:, None, :]), axis=(0, 1, 2))
         return jnp.real(d_inner_h), jnp.real(h_inner_h)
 
     def _inputs(self, parameters):

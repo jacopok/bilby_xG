@@ -721,6 +721,14 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         frequency offset from the bin centre. Its reference does not vanish
         where the fiducial's twist and beam patterns do. The bins are
         chosen with scheme 2 either way.
+    second_order: bool, optional
+        Keep the r1 r1^* term of <h|h> (summary data b2), so that <h|h> is
+        the exact norm of the reconstructed waveform h0 (r0 + r1 (f - f_c)),
+        never negative, and ln L never exceeds <d|d> / 2. Without it (the
+        form of Zackay, Dai & Venumadhav 2018, which drops it as of second
+        order in the bin width) the quadratic form is indefinite, and ln L
+        can be absurdly large where a bin's ratio varies by orders of
+        magnitude.
 
     Returns
     -------
@@ -738,6 +746,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
     orbital_motion = False
     center = None
     precessing_scheme = "ratio"
+    second_order = True
 
     def __init__(self, interferometers,
                  waveform_generator,
@@ -765,8 +774,10 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                  summary_data_chunk_size=2 ** 20,
                  array_cache_dir=None,
                  injection=None,
-                 precessing_scheme="ratio"):
+                 precessing_scheme="ratio",
+                 second_order=True):
 
+        self.second_order = second_order
         if precessing_scheme not in ("ratio", "split"):
             raise ValueError(f"unknown precessing_scheme {precessing_scheme!r}")
         self.precessing_scheme = precessing_scheme
@@ -1219,7 +1230,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 'a0': dict(),
                 'a1': dict(),
                 'b0': dict(),
-                'b1': dict()
+                'b1': dict(),
+                'b2': dict()
             }
 
             mask = interferometer.frequency_mask
@@ -1239,7 +1251,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                           else interferometer.strain_data._frequency_domain_strain)
             psd_model = interferometer.power_spectral_density
             window_power_correction = interferometer._window_power_correction
-            a0, b0, a1, b1 = dict(), dict(), dict(), dict()
+            a0, b0, a1, b1, b2 = dict(), dict(), dict(), dict(), dict()
             s_inner_s, s_inner_n = 0.0, 0j
             if injection is not None and injection.noise:
                 # standard circular complex normals, one per basis function
@@ -1255,11 +1267,12 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 key = f'{ell},{emm}'
                 b0[key] = dict()
                 b1[key] = dict()
+                b2[key] = dict()
                 a0[key], a1[key] = np.zeros((2, self.number_of_bins), dtype=complex)
 
                 for ellp, emmp in self.mode_array[j::]:
-                    b0[key][f'{ellp},{emmp}'], b1[key][f'{ellp},{emmp}'] = \
-                        np.zeros((2, self.number_of_bins), dtype=complex)
+                    (b0[key][f'{ellp},{emmp}'], b1[key][f'{ellp},{emmp}'],
+                     b2[key][f'{ellp},{emmp}']) = np.zeros((3, self.number_of_bins), dtype=complex)
 
             for chunk_start, chunk_end in self._bin_chunks(masked_bin_inds):
                 chunk_lo = masked_bin_inds[chunk_start]
@@ -1313,6 +1326,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                             h0_p = chunk_h0[keyp][idxs]
                             b0[key][keyp][i] = noise_weighted_inner_product(h0_p, h0, psd, duration)
                             b1[key][keyp][i] = noise_weighted_inner_product(h0_p, h0 * delta_frequency, psd, duration)
+                            b2[key][keyp][i] = noise_weighted_inner_product(
+                                h0_p * delta_frequency, h0 * delta_frequency, psd, duration)
 
                     if injection is None:
                         continue
@@ -1347,15 +1362,19 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 if key not in summary_data[interferometer.name]['b0']:
                     summary_data[interferometer.name]['b0'][key] = dict()
                     summary_data[interferometer.name]['b1'][key] = dict()
+                    summary_data[interferometer.name]['b2'][key] = dict()
                 for ellp, emmp in self.mode_array[i::]:
                     keyp = f'{ellp},{emmp}'
                     if keyp not in summary_data[interferometer.name]['b0']:
                         summary_data[interferometer.name]['b0'][keyp] = dict()
                         summary_data[interferometer.name]['b1'][keyp] = dict()
+                        summary_data[interferometer.name]['b2'][keyp] = dict()
                     summary_data[interferometer.name]['b0'][key][keyp] = b0[key][keyp]
                     summary_data[interferometer.name]['b1'][key][keyp] = b1[key][keyp]
                     summary_data[interferometer.name]['b0'][keyp][key] = np.conj(b0[key][keyp])
                     summary_data[interferometer.name]['b1'][keyp][key] = np.conj(b1[key][keyp])
+                    summary_data[interferometer.name]['b2'][key][keyp] = b2[key][keyp]
+                    summary_data[interferometer.name]['b2'][keyp][key] = np.conj(b2[key][keyp])
 
             # Free this detector's full-band frequency array/mask/PSD cache
             # (repopulated above by the frequency_mask/frequency_array
@@ -1391,6 +1410,33 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
             cache = (key, self.bin_freqs, {})
             self._shared_response_cache = cache
         return cache[2]
+
+    def _second_order_summary_data(self, name):
+        """The b2 summary data of detector ``name``, sum h0_k^* h0_k' (f - f_c)^2 / S.
+
+        With it <h|h> is the exact norm of the reconstructed waveform
+        h0 (r0 + r1 (f - f_c)), so it is never negative and ln L never exceeds
+        <d|d> / 2. Without it the quadratic form is indefinite: where a bin's
+        ratio changes by orders of magnitude (a fiducial mode that has nearly
+        died out at a bin edge, as at the waveform model's cut-off), <h|h> can
+        be hugely negative and ln L absurdly large. Likelihoods pickled before
+        b2 existed lack it: they get zeros, the old (unsafe) form, with a
+        warning.
+        """
+        summary = self.summary_data[name]
+        if not self.second_order:
+            return {key: {keyp: np.zeros_like(value) for keyp, value in row.items()}
+                    for key, row in summary["b1"].items()}
+        if "b2" not in summary:
+            if not getattr(self, "_warned_missing_b2", False):
+                logger.warning(
+                    "Summary data without b2 (computed by an older bilby_xG): <h|h> is "
+                    "not guaranteed positive and ln L can be grossly wrong; recompute "
+                    "the summary data")
+                self._warned_missing_b2 = True
+            summary["b2"] = {key: {keyp: np.zeros_like(value) for keyp, value in row.items()}
+                             for key, row in summary["b1"].items()}
+        return summary["b2"]
 
     def __getstate__(self):
         # the shared-response cache is per evaluation, and its layout may
@@ -1544,6 +1590,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         a1 = self.summary_data[interferometer.name]['a1'].copy()
         b0 = self.summary_data[interferometer.name]['b0'].copy()
         b1 = self.summary_data[interferometer.name]['b1'].copy()
+        b2 = self._second_order_summary_data(interferometer.name)
 
         d_inner_h, h_inner_h = np.zeros(2, dtype=complex)
         for ell, emm in self.mode_array:
@@ -1554,7 +1601,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 keyp = f"{ellp},{emmp}"
                 h_inner_h += np.sum(
                     b0[key][keyp] * r0[key] * np.conj(r0[keyp])
-                    + b1[key][keyp] * (r0[key] * np.conj(r1[keyp]) + np.conj(r0[keyp]) * r1[key]))
+                    + b1[key][keyp] * (r0[key] * np.conj(r1[keyp]) + np.conj(r0[keyp]) * r1[key])
+                    + b2[key][keyp] * r1[key] * np.conj(r1[keyp]))
 
         optimal_snr_squared = h_inner_h
         complex_matched_filter_snr = d_inner_h / (optimal_snr_squared ** 0.5)

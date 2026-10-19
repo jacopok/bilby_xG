@@ -158,8 +158,9 @@ class GridModel:
     """Fiducial prefix sums on a geometric grid: the continuum analogue of
     the relative-binning summary data, with d = h_fid."""
 
-    def __init__(self, projector, fiducial_parameters, freqs):
+    def __init__(self, projector, fiducial_parameters, freqs, second_order=True):
         self.projector = projector
+        self.second_order = second_order
         self.freqs = freqs
         self.psd = np.array([
             ifo.power_spectral_density.get_power_spectral_density_array(freqs)
@@ -174,6 +175,7 @@ class GridModel:
         b = self.h0[:, :, None, :] * np.conj(self.h0[:, None, :, :]) * weight[:, None]
         self.B0 = trapezoid_prefix(b, freqs)
         self.B1 = trapezoid_prefix(b * freqs, freqs)
+        self.B2 = trapezoid_prefix(b * freqs ** 2, freqs) if second_order else None
         self.norm_d = float(np.real(4 * np.trapezoid(np.abs(self.d) ** 2 / self.psd, x=freqs).sum()))
 
     def inner(self, a, b):
@@ -203,7 +205,7 @@ class GridPoint:
     def bin_errors(self, lo, hi):
         """Signed exact - relative-binning log-likelihood error for the bins
         [freqs[lo], freqs[hi]] (index arrays), with the same linear-ratio
-        approximation (and the same dropped r1 r1* term) as the likelihood."""
+        approximation (and the same r1 r1* term, or none) as the likelihood."""
         m = self.model
         f_lo, f_hi = m.freqs[lo], m.freqs[hi]
         fc = 0.5 * (f_lo + f_hi)
@@ -218,6 +220,11 @@ class GridPoint:
         hh = (np.einsum("ikpb,ikb,ipb->ib", B0, r0, np.conj(r0))
               + np.einsum("ikpb,ikb,ipb->ib", B1, r0, np.conj(r1))
               + np.einsum("ikpb,ipb,ikb->ib", B1, np.conj(r0), r1))
+        if m.second_order:
+            # sum b (f - f_c)^2, from the prefix sums of b, b f and b f^2
+            B2 = (m.B2[..., hi] - m.B2[..., lo] - 2 * fc * (m.B1[..., hi] - m.B1[..., lo])
+                  + fc ** 2 * B0)
+            hh = hh + np.einsum("ikpb,ikb,ipb->ib", B2, r1, np.conj(r1))
         approx = np.sum(np.real(dh) - 0.5 * np.real(hh), axis=0)
         return self.E[hi] - self.E[lo] - approx
 
@@ -380,8 +387,15 @@ class PointFinder:
         return params, h
 
 
-# multiprocessing (fork): workers inherit the finder
+# multiprocessing (spawn): each worker receives the finder once, through the
+# pool initializer. Not fork: the parent already runs threads (JAX, BLAS), and
+# a forked child can inherit one of their locks held, deadlocking the pool.
 _FINDER = None
+
+
+def _set_finder(finder):
+    global _FINDER
+    _FINDER = finder
 
 
 def _training_point(args):
@@ -405,7 +419,8 @@ def _scan_point(args):
 def _map(function, tasks, npool):
     if npool <= 1:
         return [function(task) for task in tasks]
-    with multiprocessing.get_context("fork").Pool(npool) as pool:
+    with multiprocessing.get_context("spawn").Pool(
+            npool, initializer=_set_finder, initargs=(_FINDER,)) as pool:
         return pool.map(function, tasks, chunksize=1)
 
 
@@ -416,7 +431,7 @@ def select_relative_binning_bins(
         n_evidence=64, max_eta_iterations=8, n_grid=30_001, n_scan_draws=4,
         scan_betas=np.geomspace(1e-8, 1, 17), comparison_bins=None,
         earth_rotation_time_delay=True, earth_rotation_beam_patterns=True, finite_size=True,
-        npool=1, outdir=None, orbital_motion=True, center=None):
+        npool=1, outdir=None, orbital_motion=True, center=None, second_order=True):
     """Select relative-binning bin edges for the mode-by-mode likelihood.
 
     Parameters
@@ -469,6 +484,9 @@ def select_relative_binning_bins(
         Worker processes (fork) for the training-point search.
     outdir: str, optional
         Where the bin edges, a JSON summary and the summary plots are written.
+    second_order: bool
+        Whether the likelihood the bins are for keeps the r1 r1^* term of
+        <h|h> (its ``second_order``).
 
     Returns
     -------
@@ -482,7 +500,7 @@ def select_relative_binning_bins(
     f_max = min(maximum_frequency, projector.maximum_frequency(
         fiducial_parameters, minimum_frequency, maximum_frequency))
     freqs = np.geomspace(minimum_frequency, f_max, n_grid)
-    model = GridModel(projector, fiducial_parameters, freqs)
+    model = GridModel(projector, fiducial_parameters, freqs, second_order=second_order)
     _FINDER = PointFinder(model, fiducial_parameters)
     logger.info(f"Bin selection: geometric grid of {n_grid} points over "
                 f"[{minimum_frequency:.4g}, {f_max:.4g}] Hz; searching {n_train} + "
