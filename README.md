@@ -157,6 +157,14 @@ cryogenic high-and-low-frequency PSDs `ET_10_HFLF_psd.txt` /
 `ET_10_HF_psd_pub.txt` / `ET_15_HF_psd_pub.txt`), resolved automatically by
 `bilby_xG.networks`.
 
+The published HF PSDs are the default pyGWINC sensitivity of the ET
+sensitivity curves (https://gitlab.et-gw.eu/pub/et-sensitivity-curves, the
+January 2026 snapshot), which includes a high-frequency correction: the
+finite-size response for a signal 15 degrees off zenith. With the
+finite-size response (`finite_size=True`) that suppression is counted twice.
+`ET_10_HF_psd_pub_nofsr.txt` / `ET_15_HF_psd_pub_nofsr.txt` are the same
+curves without it, the displacement ASD over the arm length squared.
+
 By default, the `ET-EMR`, `ET_1L_IT` and `ET_1L_DE` definitions use the **HFLF**
 sensitivity with `minimum_frequency = 3` Hz. 
 To run with the high-frequency-only curve instead, 

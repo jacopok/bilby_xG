@@ -88,6 +88,10 @@ __author__ = [
 
 _DEFAULT_GAMMA = np.array([-5 / 3, -2 / 3, 1, 5 / 3, 7 / 3])
 
+#: the |m| of the modes in the bilby-x-g fork's injections (its
+#: lal_binary_black_hole_individual_modes, keyed by |m| in 2, 3, 4)
+LEGACY_INJECTION_M = (2, 3, 4)
+
 
 #: The parameters the detector-independent part of the response depends on
 #: (sky position, time, polarisation, the time-to-coalescence masses and spins,
@@ -729,6 +733,30 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         order in the bin width) the quadratic form is indefinite, and ln L
         can be absurdly large where a bin's ratio varies by orders of
         magnitude.
+    legacy: bool, optional
+        Reproduce the likelihood of the bilby-x-g fork's
+        ``RelativeBinningGravitationalWaveTransientNextGenerationModebyMode``
+        (Baral et al.; the BNSs_with_ETs runs), quirks included, for
+        replications that must match those runs exactly:
+
+        * the fiducial modes evaluated on the full uniform frequency grid
+          (for IMRPhenomX, with LAL's multibanding), not as frequency
+          sequences, and held in memory until the summary data are built;
+        * the maximum frequency of the fiducial off by the index of the
+          minimum frequency (the last non-zero index of the band above it,
+          read as an index of the full grid), so the bins stop
+          ``minimum_frequency`` short of the waveform's end;
+        * the ``a1``/``b1`` summary data about the midpoint of each bin's
+          first and last samples, not of its edges;
+        * with ``injection``, the data of the fork's
+          ``lal_binary_black_hole_individual_modes``, which keeps only the
+          modes with ``|m|`` of 2, 3 or 4 (no (2, 1)): the fiducial modes at
+          the injection, which must then be the fiducial parameters, in
+          zero noise.
+
+        Needs ``second_order=False`` (the fork had no b2), no time
+        marginalisation and no fiducial update. Bins without ``bin_freqs``
+        follow ``chi``/``epsilon`` as the fork's (it used ``epsilon=0.05``).
 
     Returns
     -------
@@ -747,6 +775,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
     center = None
     precessing_scheme = "ratio"
     second_order = True
+    legacy = False
 
     def __init__(self, interferometers,
                  waveform_generator,
@@ -775,8 +804,34 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                  array_cache_dir=None,
                  injection=None,
                  precessing_scheme="ratio",
-                 second_order=True):
+                 second_order=True,
+                 legacy=False):
 
+        if legacy:
+            if second_order:
+                raise ValueError("legacy needs second_order=False: the fork had no b2")
+            if time_marginalization or update_fiducial_parameters:
+                raise ValueError("legacy supports neither time marginalization nor "
+                                 "a fiducial update")
+            if precessing_scheme != "ratio":
+                raise ValueError("legacy needs precessing_scheme='ratio'")
+            if injection is not None:
+                # the data are made of the fiducial modes
+                if injection.noise:
+                    raise ValueError("legacy injections are in zero noise")
+                differ = sorted(
+                    key for key, value in injection.parameters.items()
+                    if fiducial_parameters is None or key not in fiducial_parameters
+                    or not np.all(fiducial_parameters[key] == value)) + sorted(
+                    name for name, value in [
+                        ("earth_rotation_time_delay", earth_rotation_time_delay),
+                        ("earth_rotation_beam_patterns", earth_rotation_beam_patterns),
+                        ("finite_size", finite_size), ("orbital_motion", orbital_motion)]
+                    if bool(value) != getattr(injection, name))
+                if differ:
+                    raise ValueError("legacy: the injection must be the fiducial, with this "
+                                     f"likelihood's response; they differ in {differ}")
+        self.legacy = legacy
         self.second_order = second_order
         if precessing_scheme not in ("ratio", "split"):
             raise ValueError(f"unknown precessing_scheme {precessing_scheme!r}")
@@ -863,6 +918,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         self.setup_bins()
         self.compute_summary_data()
         logger.info("Summary Data Obtained")
+        # the full-grid fiducial modes are only needed for the summary data
+        self._legacy_fiducial = None
 
         if update_fiducial_parameters:
             # write a check to make sure prior is not None
@@ -981,6 +1038,11 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         # chunks later (setup_bins, compute_summary_data, _compute_full_waveform)
         # instead of storing them at full resolution here.
         self._fiducial_converted_parameters = converted_parameters
+        if self.legacy:
+            self._legacy_fiducial = self._legacy_fiducial_modes(converted_parameters)
+            self.maximum_frequency = self._legacy_maximum_frequency()
+            logger.debug(f"Maximum fiducial frequency (legacy): {self.maximum_frequency}")
+            return
         self.maximum_frequency = self._fiducial_maximum_frequency(converted_parameters)
         logger.debug(f"Maximum fiducial frequency: {self.maximum_frequency}")
 
@@ -1007,6 +1069,48 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         polarizations = wfg.frequency_domain_source_model(
             wfg.frequency_array, **source_parameters)
         return polarizations[mode_key]
+
+    def _legacy_fiducial_modes(self, converted_parameters):
+        """With ``legacy``: each fiducial mode's plus/cross polarizations on
+        the full frequency grid, as the fork's ``fiducial=1`` source call
+        gives them (``{mode_key: (plus, cross)}``)."""
+        wfg = self.waveform_generator
+        source_parameters = {
+            key: value for key, value in converted_parameters.items()
+            if key in wfg.source_parameter_keys
+        }
+        source_parameters["fiducial"] = 1
+        modes = dict()
+        for ell, emm in self.mode_array:
+            mode_key = f"{ell},{emm}"
+            waveform_arguments = dict(wfg.waveform_arguments, mode_array=[[ell, emm]])
+            waveform_arguments.pop("frequency_bin_edges", None)
+            polarizations = wfg.frequency_domain_source_model(
+                wfg.frequency_array, **source_parameters, **waveform_arguments)[mode_key]
+            modes[mode_key] = (polarizations["plus"], polarizations["cross"])
+            logger.info(f"Legacy fiducial mode {mode_key} on the full grid "
+                        f"({len(wfg.frequency_array)} frequencies)")
+        return modes
+
+    def _legacy_maximum_frequency(self):
+        """With ``legacy``: the fork's maximum fiducial frequency. Its last
+        non-zero index of each mode above an interferometer's minimum
+        frequency (less one sample) is read as an index of the full grid, so
+        the frequency is that many samples short; the minimum over the modes
+        and interferometers."""
+        frequency_array = self.waveform_generator.frequency_array
+        maxima = []
+        for interferometer in self.interferometers:
+            frequencies = interferometer.frequency_array
+            above = frequencies > (interferometer.minimum_frequency
+                                   - (frequencies[1] - frequencies[0]))
+            for plus, _ in self._legacy_fiducial.values():
+                nonzero = np.flatnonzero(plus[above] != 0j)
+                if len(nonzero):
+                    maxima.append(frequency_array[nonzero[-1]])
+        if maxima:
+            return min(maxima)
+        return self.interferometers[-1].maximum_frequency
 
     def _fiducial_maximum_frequency(self, converted_parameters):
         """Largest frequency at which any fiducial mode is non-zero.
@@ -1146,8 +1250,19 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         above_minimum_frequency = frequencies > (interferometer.minimum_frequency - df)
         freqs = frequencies[above_minimum_frequency]
 
-        mode_polarizations = self._fiducial_mode_polarizations(
-            converted_parameters, mode_key, freqs)
+        if self.legacy:
+            if getattr(self, "_legacy_fiducial", None) is None:
+                raise RuntimeError("legacy: the full-grid fiducial modes are only kept "
+                                   "until the summary data are built")
+            grid = self.waveform_generator.frequency_array
+            index = np.searchsorted(grid, freqs)
+            if not np.array_equal(grid[index], freqs):
+                raise ValueError("legacy: fiducial frequencies off the data grid")
+            plus, cross = self._legacy_fiducial[mode_key]
+            mode_polarizations = dict(plus=plus[index], cross=cross[index])
+        else:
+            mode_polarizations = self._fiducial_mode_polarizations(
+                converted_parameters, mode_key, freqs)
         if part == "fast":
             keys = ('coprecessing', 'c_plus', 'c_cross')
         else:
@@ -1278,13 +1393,6 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                 chunk_lo = masked_bin_inds[chunk_start]
                 chunk_hi = masked_bin_inds[chunk_end]
                 chunk_frequencies = masked_frequency_array[chunk_lo:chunk_hi]
-                if raw_strain is None:
-                    chunk_strain = injection.signal(interferometer, chunk_frequencies)
-                elif is_contiguous:
-                    chunk_strain = raw_strain[
-                        raw_offset + chunk_lo:raw_offset + chunk_hi]
-                else:
-                    chunk_strain = raw_strain[in_band_indices[chunk_lo:chunk_hi]]
                 chunk_psd = (
                     psd_model.get_power_spectral_density_array(chunk_frequencies)
                     * window_power_correction)
@@ -1293,6 +1401,18 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                         interferometer, f'{ell},{emm}', chunk_frequencies)
                     for ell, emm in self.mode_array
                 }
+                if raw_strain is None and self.legacy:
+                    # the fork's injection: its fiducial modes with |m| of
+                    # 2, 3 or 4 (the bins end below the fiducial's zeroing)
+                    chunk_strain = sum(chunk_h0[f'{ell},{emm}'] for ell, emm in self.mode_array
+                                       if abs(emm) in LEGACY_INJECTION_M)
+                elif raw_strain is None:
+                    chunk_strain = injection.signal(interferometer, chunk_frequencies)
+                elif is_contiguous:
+                    chunk_strain = raw_strain[
+                        raw_offset + chunk_lo:raw_offset + chunk_hi]
+                else:
+                    chunk_strain = raw_strain[in_band_indices[chunk_lo:chunk_hi]]
 
                 logger.info(
                     f"{interferometer.name}: summary data bins "
@@ -1309,8 +1429,12 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
                     # the centre the ratios' r0 refer to (the midpoint of the
                     # bin edges), not that of the samples in the bin: they
                     # differ by up to a sample spacing, an error of r1 times
-                    # it which more bins do not reduce
-                    delta_frequency = frequencies - self.bin_centers[i]
+                    # it which more bins do not reduce (legacy: the fork's,
+                    # the samples' midpoint)
+                    if self.legacy:
+                        delta_frequency = frequencies - (frequencies[0] + frequencies[-1]) / 2
+                    else:
+                        delta_frequency = frequencies - self.bin_centers[i]
 
                     strain = chunk_strain[idxs]
                     psd = chunk_psd[idxs]
@@ -1443,6 +1567,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(Gravitat
         # change between versions
         state = self.__dict__.copy()
         state.pop("_shared_response_cache", None)
+        state.pop("_legacy_fiducial", None)
         return state
 
     def __setstate__(self, state):
