@@ -134,6 +134,24 @@ and sample the time with `time_reference="geocenter"`, reading
 `geocent_time` as the arrival time at the center. The choice only relabels
 the time; use the same center for the injection and the likelihood.
 
+A GPS time `~1e9` s is resolved in double precision only to
+`2**-22 s ~ 2.4e-7 s`; at the SNRs of next-generation detectors that is a
+sizeable fraction of the width of the time posterior, and through
+`geocent_time` the likelihood is a staircase in time (steps of `~0.1` in
+`ln L` for an ET BNS at 40 Mpc). Sample instead `geocent_time_offset`, the
+time from a fixed `time_origin` given as a fixed parameter, e.g.
+
+```python
+priors["geocent_time_offset"] = bilby.core.prior.Uniform(-0.1, 0.1)
+priors["time_origin"] = bilby.core.prior.DeltaFunction(trigger_time)
+```
+
+The likelihoods, injections and bin selection then take the phase from
+`(time_origin - start_time) + geocent_time_offset`, and form the absolute time
+only for the Earth's orientation and position (`bilby_xG.conversion.time_after`).
+The offset needs the sky frame, the geocentre time reference and no time
+marginalisation.
+
 With `orbital_motion=True` the detector-frame masses and distance are those
 of the Solar-System-barycentre frame, whatever the center. To first order in
 `v/c` they differ from those inferred with `orbital_motion=False` (a frame

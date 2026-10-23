@@ -10,6 +10,9 @@ these converters explicitly, e.g.::
         ...,
         parameter_conversion=bilby_xG.conversion.convert_to_lal_binary_black_hole_parameters,
     )
+
+Also the coalescence time as an offset from a fixed origin
+(:func:`time_after`, :func:`geocent_time`).
 """
 import numpy as np
 from bilby.gw.conversion import (
@@ -18,6 +21,40 @@ from bilby.gw.conversion import (
 )
 
 __author__ = ["Pratyusava Baral <pbaral@uwm.edu>", "Soichiro Morisaki"]
+
+#: The coalescence time (s) relative to ``time_origin`` (GPS s): sampled in
+#: place of ``geocent_time``, with ``time_origin`` a fixed parameter (a
+#: number or a ``DeltaFunction`` in the prior dict), see :func:`time_after`.
+TIME_OFFSET = "geocent_time_offset"
+TIME_ORIGIN = "time_origin"
+
+
+def geocent_time(parameters):
+    """The coalescence time ``geocent_time`` (GPS s), from ``time_origin``
+    and ``geocent_time_offset`` when the offset is given.
+
+    Rounded to double precision (2**-22 s ~ 2.4e-7 s for GPS times between
+    2**30 and 2**31 s): only for quantities varying slowly with time, such
+    as the Earth's orientation and position; phases need
+    :func:`time_after`."""
+    if TIME_OFFSET in parameters:
+        return parameters[TIME_ORIGIN] + parameters[TIME_OFFSET]
+    return parameters["geocent_time"]
+
+
+def time_after(parameters, start_time):
+    """``geocent_time - start_time``, at full precision when the time is
+    given as ``geocent_time_offset`` from ``time_origin``.
+
+    A GPS time ~1e9 s is resolved in double precision only to ~2.4e-7 s,
+    which at the SNRs of next-generation detectors is a sizeable fraction
+    of the width of the time posterior: through ``geocent_time`` the
+    likelihood is a staircase in time. Here the large difference
+    ``time_origin - start_time`` is taken first (exactly, for nearby times)
+    and the offset added to it, so the absolute time is never formed."""
+    if TIME_OFFSET in parameters:
+        return (parameters[TIME_ORIGIN] - start_time) + parameters[TIME_OFFSET]
+    return parameters["geocent_time"] - start_time
 
 
 def _add_log10_luminosity_distance(parameters):

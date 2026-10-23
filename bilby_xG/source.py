@@ -1810,7 +1810,7 @@ phase = {
 }
 extrinsic = {
     "azimuth", "zenith", "luminosity_distance", "psi", "theta_jn",
-    "cos_theta_jn", "geocent_time", "time_jitter", "ra", "dec",
+    "cos_theta_jn", "geocent_time", "geocent_time_offset", "time_jitter", "ra", "dec",
     "H1_time", "L1_time", "V1_time",
 }
 sky = {

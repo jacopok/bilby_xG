@@ -20,9 +20,10 @@ contraction.
 
 Scope of the prototype: general relativity only (no ``vG`` / ``(a, A)``),
 no distance/phase/time marginalisation, ``reference_frame="sky"`` with
-geocentre time. The detector motion (:mod:`bilby_xG.motion`) is evaluated on
-the ephemeris tabulated over the data segment, in the axes of date at its
-start. The JAX surrogate agrees with the numpy one only to the
+geocentre time (``geocent_time``, or ``geocent_time_offset`` from
+``time_origin``, see :func:`bilby_xG.conversion.time_after`). The detector
+motion (:mod:`bilby_xG.motion`) is evaluated on the ephemeris tabulated over
+the data segment, in the axes of date at its start. The JAX surrogate agrees with the numpy one only to the
 rounding of its kernel-ridge regressors (see :mod:`mlgw_bns.batched`); see
 ``benchmarks/et_mlgw_bns_batched.py`` for the resulting log-likelihood
 differences and the speed-up.
@@ -38,6 +39,7 @@ from bilby.core.likelihood import Likelihood
 from bilby.core.utils import logger, speed_of_light
 from bilby_cython.geometry import greenwich_mean_sidereal_time
 
+from .conversion import time_after
 from .motion import default_ephemeris, hermite_interpolate, precession_matrix, resolve_center
 from .utils import calculate_time_to_merger_for_any_mode
 
@@ -238,6 +240,9 @@ class BatchedRelativeBinningLikelihood(Likelihood):
     def __init__(self, likelihood, batch_size=256):
         import jax
 
+        # the phases need double precision (as does the mlgw_bns surrogate,
+        # which also enables it)
+        jax.config.update("jax_enable_x64", True)
         from .source import (_mlgw_bns_model, mlgw_bns_individual_modes,
                              mlgw_bns_precessing_individual_modes)
 
@@ -355,7 +360,7 @@ class BatchedRelativeBinningLikelihood(Likelihood):
         from .likelihood import split_scheme_coefficients
 
         f = arrays["frequencies"]
-        ifo_time = p["geocent_time"] - self.start_time
+        ifo_time = p["elapsed"]
         earth_rotation = self._flags[0] or self._flags[1]
 
         frames = {}
@@ -430,7 +435,10 @@ class BatchedRelativeBinningLikelihood(Likelihood):
             lambda_2=converted["LambdaBl2"], total_mass=converted["M"],
             distance=converted["distance"], mass_1=converted["mass_1"],
             mass_2=converted["mass_2"], ra=converted["ra"], dec=converted["dec"],
-            psi=converted["psi"], geocent_time=times, gmst=gmst, gmst_rate=gmst_rate)
+            psi=converted["psi"], geocent_time=times, gmst=gmst, gmst_rate=gmst_rate,
+            # geocent_time - start_time at full precision (geocent_time,
+            # for the Earth's orientation and position, is rounded)
+            elapsed=time_after(converted, self.start_time))
         if self.precessing:
             inputs.update({key: converted[key] for key in (
                 "chi_1", "chi_2", "a_1", "a_2", "tilt_1", "tilt_2", "phi_12", "phi_jl",

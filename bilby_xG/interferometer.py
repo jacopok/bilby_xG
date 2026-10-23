@@ -27,6 +27,7 @@ from bilby.core.utils import logger, ra_dec_to_theta_phi, speed_of_light
 from bilby.gw.detector.calibration import Recalibrate
 from bilby.gw.detector.interferometer import Interferometer as _Interferometer
 
+from .conversion import geocent_time, time_after
 from .geometry import InterferometerGeometry
 from .motion import geocentre_delay as _geocentre_delay, resolve_center, sky_direction
 from .propagation import Propagation, build_propagation
@@ -275,7 +276,8 @@ class Interferometer(_Interferometer):
             times_to_coalescence, propagation=None,
             earth_rotation_time_delay=True, earth_rotation_beam_patterns=True,
             finite_size=True, wave_frame=None, orbital_motion=True,
-            center=None, geocentre_delay=None, split=False, delay_directions=None):
+            center=None, geocentre_delay=None, split=False, delay_directions=None,
+            elapsed_time=None):
         """Frequency-dependent plus/cross antenna response.
 
         See Nishizawa et al. (2009) arXiv:0903.0528 for the polarisation
@@ -322,6 +324,11 @@ class Interferometer(_Interferometer):
             arrival-time delay of the vertex, if not those of the wave frame
             (with ``static_response_time``, where the beam patterns are
             frozen but the delay is not).
+        elapsed_time: float, optional
+            ``time - start_time``, if known more precisely than the
+            difference of the two GPS times (see
+            :func:`bilby_xG.conversion.time_after`); ``time`` is then only
+            used for the Earth's orientation and position.
 
         Returns
         =======
@@ -401,7 +408,9 @@ class Interferometer(_Interferometer):
                 ra, dec, time, times_to_coalescence, center=center,
                 orbital_motion=orbital_motion)
         delays = geocentre_delay - vertex_distance / speed_of_light
-        ifo_times = time - start_time + delays / propagation.group_velocity(frequencies)
+        if elapsed_time is None:
+            elapsed_time = time - start_time
+        ifo_times = elapsed_time + delays / propagation.group_velocity(frequencies)
 
         exp_fac = np.exp(-1j * 2. * np.pi * frequencies * ifo_times)
         if split:
@@ -463,11 +472,15 @@ class Interferometer(_Interferometer):
         Solar-System-barycentre frame), and ``parameters['geocent_time']`` is
         the arrival time at ``center`` (a :class:`bilby_xG.motion.Center`, or
         anything :func:`bilby_xG.motion.resolve_center` accepts; the
-        geocentre by default).
+        geocentre by default). It can be given instead as
+        ``geocent_time_offset`` from ``time_origin``, which keeps the phase
+        exact (see :func:`bilby_xG.conversion.time_after`).
 
         Note: the calibration model is not applied here; only plus and cross
         modes are used.
         """
+        time = geocent_time(parameters)
+        elapsed_time = time_after(parameters, start_time)
         propagation = build_propagation(parameters)
         center = resolve_center(center, [self])
         if shared is None:
@@ -495,7 +508,7 @@ class Interferometer(_Interferometer):
                         frequencies, parameters['mass_1'], parameters['mass_2'],
                         parameters['chi_1'], parameters['chi_2'], mode=mode, safety=1)
                 frame = compute_wave_frame(
-                    parameters['ra'], parameters['dec'], parameters['geocent_time'],
+                    parameters['ra'], parameters['dec'], time,
                     parameters['psi'], frequencies, times_to_coalescence,
                     earth_rotation=earth_rotation)
                 delay_directions = None
@@ -503,7 +516,7 @@ class Interferometer(_Interferometer):
                     # the beam patterns at merger, the delay still rotating
                     delay_directions = frame[0]
                     frame = compute_wave_frame(
-                        parameters['ra'], parameters['dec'], parameters['geocent_time'],
+                        parameters['ra'], parameters['dec'], time,
                         parameters['psi'], frequencies,
                         np.where(times_to_coalescence > static_time,
                                  times_to_coalescence, 0.),
@@ -514,13 +527,13 @@ class Interferometer(_Interferometer):
                     frame,
                     _geocentre_delay(
                         parameters['ra'], parameters['dec'],
-                        parameters['geocent_time'], times_to_coalescence,
+                        time, times_to_coalescence,
                         center=center, orbital_motion=orbital_motion),
                     delay_directions)
             (times_to_coalescence, correction_factor, frame, geocentre_delay,
              delay_directions) = shared[cache_key]
             factors = self.frequency_dependent_antenna_response(
-                parameters['ra'], parameters['dec'], parameters['geocent_time'],
+                parameters['ra'], parameters['dec'], time,
                 parameters['psi'],
                 times_to_coalescence=times_to_coalescence,
                 propagation=propagation,
@@ -535,6 +548,7 @@ class Interferometer(_Interferometer):
                 geocentre_delay=geocentre_delay,
                 split=split,
                 delay_directions=delay_directions,
+                elapsed_time=elapsed_time,
             )
             if split:
                 fps, fcs, delay_phase = factors

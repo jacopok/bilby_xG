@@ -42,6 +42,7 @@ from bilby.gw.likelihood import (
 )
 from bilby.gw.utils import noise_weighted_inner_product
 
+from .conversion import TIME_OFFSET, TIME_ORIGIN, geocent_time
 from .interferometer import TIME_TO_MERGER_KEY
 from .injection import complex_gaussian
 from .motion import resolve_center
@@ -97,8 +98,8 @@ LEGACY_INJECTION_M = (2, 3, 4)
 #: (sky position, time, polarisation, the time-to-coalescence masses and spins,
 #: and the propagation model's parameters).
 _SHARED_RESPONSE_KEYS = (
-    "ra", "dec", "geocent_time", "psi", "mass_1", "mass_2", "chi_1", "chi_2",
-    "vG", "a", "A", "luminosity_distance", "H0")
+    "ra", "dec", "geocent_time", TIME_ORIGIN, TIME_OFFSET, "psi", "mass_1", "mass_2",
+    "chi_1", "chi_2", "vG", "a", "A", "luminosity_distance", "H0")
 
 
 def _clear_waveform_cache(waveform_generator):
@@ -170,7 +171,28 @@ def relative_binning_bin_freqs(frequency_array, minimum_frequency, maximum_frequ
     return frequency_array_useful[unique_bin_indices]
 
 
-class GravitationalWaveTransientNextGeneration(GravitationalWaveTransient):
+class _TimeOffset:
+    """Accepts the coalescence time as ``geocent_time_offset`` from a fixed
+    ``time_origin`` (a fixed parameter), which keeps the phase of
+    the response exact (see :func:`bilby_xG.conversion.time_after`), as
+    well as ``geocent_time``. The offset needs the sky frame, the geocentre
+    time (a :class:`~bilby_xG.motion.Center` included) and no time
+    marginalisation."""
+
+    def get_sky_frame_parameters(self, parameters=None):
+        parameters = _resolve_parameters(self, parameters)
+        if TIME_OFFSET not in parameters:
+            return super().get_sky_frame_parameters(parameters=parameters)
+        if (self.reference_frame != "sky" or "geocent" not in self.time_reference
+                or self.time_marginalization):
+            raise NotImplementedError(
+                f"{TIME_OFFSET} needs reference_frame='sky', the geocentre time "
+                "reference and no time marginalisation")
+        return dict(ra=parameters["ra"], dec=parameters["dec"],
+                    geocent_time=geocent_time(parameters))
+
+
+class GravitationalWaveTransientNextGeneration(_TimeOffset, GravitationalWaveTransient):
     """Transient likelihood using the frequency-dependent antenna response.
 
     Identical to :class:`bilby.gw.likelihood.GravitationalWaveTransient` except
@@ -275,7 +297,7 @@ class GravitationalWaveTransientNextGeneration(GravitationalWaveTransient):
         return h
 
 
-class MBGravitationalWaveTransientNextGeneration(MBGravitationalWaveTransient):
+class MBGravitationalWaveTransientNextGeneration(_TimeOffset, MBGravitationalWaveTransient):
     """Multi-banded likelihood with a frequency-dependent antenna response.
 
     Combines the multi-banding of S. Morisaki (2021), arXiv:2104.07813 with the
@@ -405,7 +427,8 @@ class MBGravitationalWaveTransientNextGeneration(MBGravitationalWaveTransient):
             optimal_snr_squared_array=None)
 
 
-class RelativeBinningGravitationalWaveTransientNextGeneration(RelativeBinningGravitationalWaveTransient):
+class RelativeBinningGravitationalWaveTransientNextGeneration(
+        _TimeOffset, RelativeBinningGravitationalWaveTransient):
     """A gravitational-wave transient likelihood object capaple of handling
     frequency-dependent antenna responses which uses the relative
     binning procedure to calculate a fast likelihood. See Zackay et al.
@@ -620,7 +643,8 @@ class RelativeBinningGravitationalWaveTransientNextGeneration(RelativeBinningGra
         return [r0, r1]
 
 
-class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(GravitationalWaveTransient):
+class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
+        _TimeOffset, GravitationalWaveTransient):
     """
     This modifies code written by Ish Gupta and others to implement the
     relative binning likelihood for the HM precessing model.

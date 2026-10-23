@@ -272,8 +272,12 @@ class PointFinder:
         self.deltas = np.linspace(0, 2 * np.pi, n_phase, endpoint=False)
 
     def combine(self, draw, beta):
-        return {key: (1 - beta) * self.fiducial[key] + beta * draw.get(key, self.fiducial[key])
-                for key in self.keys}
+        # keys the draw shares with the fiducial point (fixed parameters,
+        # such as time_origin) exactly as they are: (1 - beta) x + beta x
+        # can be off by an ulp, which for a GPS time is not negligible
+        return {key: (value if (other := draw.get(key, value)) == value
+                      else (1 - beta) * value + beta * other)
+                for key, value in ((key, self.fiducial[key]) for key in self.keys)}
 
     def phase_maximized(self, h):
         """(mismatch, delta) maximizing the network match over a constant
