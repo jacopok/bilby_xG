@@ -63,9 +63,26 @@ CHUNK_SIZE = 250_000
 
 
 def delta_log_likelihood(model, h_test):
-    """ln L - ln L_max = -||h - d||^2 / 2, computed directly (no cancellation)."""
+    """ln L - ln L_max = -(||h - d||^2 - ||h_max - d||^2) / 2, computed directly
+    (no cancellation in zero noise, where h_max = d)."""
     distance2 = (4 / model.psd) * np.abs(h_test.sum(axis=1) - model.d) ** 2
-    return -0.5 * float(np.trapezoid(distance2, x=model.freqs).sum())
+    return -0.5 * float(np.trapezoid(distance2, x=model.freqs).sum()) + model.residual_max
+
+
+def grid_noise(psd, freqs, rng):
+    """Stationary Gaussian noise on a frequency grid, as :class:`GridModel`'s
+    data: at each node a circular complex Gaussian with E|n|^2 = S / (2 w),
+    with w the node's trapezoid weight, so that each grid inner product
+    <n|h> = 4 sum_i w_i n_i^* h_i / S_i has E|<n|h>|^2 = 2 <h|h>, as for the
+    noise at the full frequency resolution. The grid resolves the noise as
+    far as anything that varies on the scale of its cells (the waveforms'
+    ratios, so the likelihood and its relative-binning approximation): no
+    full-band data are needed. ``psd`` has shape (n_ifo, n_freq)."""
+    w = np.zeros_like(freqs)
+    w[1:] += np.diff(freqs) / 2
+    w[:-1] += np.diff(freqs) / 2
+    sigma = np.sqrt(psd / (4 * w))
+    return sigma * (rng.standard_normal(psd.shape) + 1j * rng.standard_normal(psd.shape))
 
 
 def nested_sampling_resolution(d, effective_dimension, n_live):
@@ -156,9 +173,15 @@ class Projector:
 
 class GridModel:
     """Fiducial prefix sums on a geometric grid: the continuum analogue of
-    the relative-binning summary data, with d = h_fid."""
+    the relative-binning summary data, with d = h_fid by default.
 
-    def __init__(self, projector, fiducial_parameters, freqs, second_order=True):
+    ``data`` (n_ifo, n_freq), the data on ``freqs`` (e.g. a signal plus
+    :func:`grid_noise`), replaces d = h_fid; ln L_max, which
+    :func:`delta_log_likelihood` refers to, is then set with
+    :meth:`set_maximum`. Mismatches (:class:`PointFinder`) are against d, so
+    training points need the zero-noise model."""
+
+    def __init__(self, projector, fiducial_parameters, freqs, second_order=True, data=None):
         self.projector = projector
         self.second_order = second_order
         self.freqs = freqs
@@ -166,7 +189,8 @@ class GridModel:
             ifo.power_spectral_density.get_power_spectral_density_array(freqs)
             for ifo in projector.interferometers])
         self.h0 = projector.project(fiducial_parameters, freqs)
-        self.d = self.h0.sum(axis=1)
+        self.d = self.h0.sum(axis=1) if data is None else np.asarray(data)
+        self.residual_max = 0.0
         weight = 4 / self.psd[:, None, :]
         a = np.conj(self.h0) * self.d[:, None, :] * weight
         self.A0 = trapezoid_prefix(a, freqs)
@@ -177,6 +201,68 @@ class GridModel:
         self.B1 = trapezoid_prefix(b * freqs, freqs)
         self.B2 = trapezoid_prefix(b * freqs ** 2, freqs) if second_order else None
         self.norm_d = float(np.real(4 * np.trapezoid(np.abs(self.d) ** 2 / self.psd, x=freqs).sum()))
+
+    def set_maximum(self, h_max):
+        """Take ``h_max`` (n_ifo, n_mode, n_freq) as the maximum-likelihood
+        strain of :func:`delta_log_likelihood`."""
+        self.residual_max = 0.0
+        self.residual_max = -delta_log_likelihood(self, h_max)
+
+    def relative_binning_terms(self, lo, hi, r_lo, r_hi):
+        """Relative-binning Re<d|h> - ||h||^2 / 2 in each of the bins
+        [freqs[lo], freqs[hi]] (index arrays), from the ratios h / h_fid at
+        their edges, (n_ifo, n_mode, n_bins) each: the linear-ratio
+        approximation of the likelihood (with the r1 r1* term, or none)."""
+        dh, hh = self.relative_binning_products(lo, hi, r_lo, r_hi)
+        return np.sum(np.real(dh) - 0.5 * hh, axis=0)
+
+    def relative_binning_products(self, lo, hi, r_lo, r_hi):
+        """The <d|h> (complex) and ||h||^2 of :meth:`relative_binning_terms`,
+        (n_ifo, n_bins) each."""
+        f_lo, f_hi = self.freqs[lo], self.freqs[hi]
+        fc = 0.5 * (f_lo + f_hi)
+        r0 = 0.5 * (r_lo + r_hi)
+        r1 = (r_hi - r_lo) / (f_hi - f_lo)
+        A0 = self.A0[..., hi] - self.A0[..., lo]
+        A1 = self.A1[..., hi] - self.A1[..., lo] - fc * A0
+        B0 = self.B0[..., hi] - self.B0[..., lo]
+        B1 = self.B1[..., hi] - self.B1[..., lo] - fc * B0
+        dh = np.sum(A0 * np.conj(r0) + A1 * np.conj(r1), axis=1)
+        hh = (np.einsum("ikpb,ikb,ipb->ib", B0, r0, np.conj(r0))
+              + np.einsum("ikpb,ikb,ipb->ib", B1, r0, np.conj(r1))
+              + np.einsum("ikpb,ipb,ikb->ib", B1, np.conj(r0), r1))
+        if self.second_order:
+            # sum b (f - f_c)^2, from the prefix sums of b, b f and b f^2
+            B2 = (self.B2[..., hi] - self.B2[..., lo]
+                  - 2 * fc * (self.B1[..., hi] - self.B1[..., lo]) + fc ** 2 * B0)
+            hh = hh + np.einsum("ikpb,ikb,ipb->ib", B2, r1, np.conj(r1))
+        return dh, np.real(hh)
+
+    def ratio(self, h, index=slice(None)):
+        """h / h_fid at the grid nodes ``index`` (0 where h_fid is)."""
+        h0 = self.h0[..., index]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(h0 != 0, h / h0, 0)
+
+    def relative_binning_log_likelihood(self, edges, h):
+        """The relative-binning Re<d|h> - ||h||^2 / 2 with bin edges at the
+        grid nodes ``edges`` (indices), from the strain ``h`` (n_ifo, n_mode,
+        len(edges)) at their frequencies only: the likelihood a run built on
+        these summary data evaluates."""
+        r = self.ratio(h, edges)
+        return float(np.sum(self.relative_binning_terms(
+            edges[:-1], edges[1:], r[..., :-1], r[..., 1:])))
+
+    def relative_binning_overlaps(self, edges, h):
+        """The relative-binning network <d|h> (complex) and ||h||^2 of
+        :meth:`relative_binning_log_likelihood`, for statistics maximized over
+        the amplitude and phase of h: Re<d|h> - ||h||^2 / 2 is largest,
+        |<d|h>|^2 / (2 ||h||^2), for h scaled by |<d|h>| / ||h||^2 and
+        rotated by the phase of <d|h>."""
+        r = self.ratio(h, edges)
+        dh, hh = self.relative_binning_products(edges[:-1], edges[1:],
+                                                r[..., :-1], r[..., 1:])
+        return complex(dh.sum()), float(hh.sum())
 
     def inner(self, a, b):
         """Network <a|b> (complex), summed over detectors (leading axis);
@@ -195,8 +281,7 @@ class GridPoint:
 
     def __init__(self, model, h_test):
         self.model = model
-        with np.errstate(divide="ignore", invalid="ignore"):
-            self.ratio = np.where(model.h0 != 0, h_test / model.h0, 0)
+        self.ratio = model.ratio(h_test)
         h = h_test.sum(axis=1)
         integrand = (4 / model.psd) * (np.real(np.conj(h) * model.d) - 0.5 * np.abs(h) ** 2)
         self.E = trapezoid_prefix(integrand, model.freqs).sum(axis=0)
@@ -206,26 +291,8 @@ class GridPoint:
         """Signed exact - relative-binning log-likelihood error for the bins
         [freqs[lo], freqs[hi]] (index arrays), with the same linear-ratio
         approximation (and the same r1 r1* term, or none) as the likelihood."""
-        m = self.model
-        f_lo, f_hi = m.freqs[lo], m.freqs[hi]
-        fc = 0.5 * (f_lo + f_hi)
-        r_lo, r_hi = self.ratio[..., lo], self.ratio[..., hi]
-        r0 = 0.5 * (r_lo + r_hi)
-        r1 = (r_hi - r_lo) / (f_hi - f_lo)
-        A0 = m.A0[..., hi] - m.A0[..., lo]
-        A1 = m.A1[..., hi] - m.A1[..., lo] - fc * A0
-        B0 = m.B0[..., hi] - m.B0[..., lo]
-        B1 = m.B1[..., hi] - m.B1[..., lo] - fc * B0
-        dh = np.sum(A0 * np.conj(r0) + A1 * np.conj(r1), axis=1)
-        hh = (np.einsum("ikpb,ikb,ipb->ib", B0, r0, np.conj(r0))
-              + np.einsum("ikpb,ikb,ipb->ib", B1, r0, np.conj(r1))
-              + np.einsum("ikpb,ipb,ikb->ib", B1, np.conj(r0), r1))
-        if m.second_order:
-            # sum b (f - f_c)^2, from the prefix sums of b, b f and b f^2
-            B2 = (m.B2[..., hi] - m.B2[..., lo] - 2 * fc * (m.B1[..., hi] - m.B1[..., lo])
-                  + fc ** 2 * B0)
-            hh = hh + np.einsum("ikpb,ikb,ipb->ib", B2, r1, np.conj(r1))
-        approx = np.sum(np.real(dh) - 0.5 * np.real(hh), axis=0)
+        approx = self.model.relative_binning_terms(
+            lo, hi, self.ratio[..., lo], self.ratio[..., hi])
         return self.E[hi] - self.E[lo] - approx
 
     def total_error(self, edges):
