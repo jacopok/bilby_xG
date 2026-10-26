@@ -1268,9 +1268,9 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         ``part="fast"`` gives the ``fast`` factor of the response instead
         (see ``precessing_scheme``).
         """
-        full_frequencies = interferometer.frequency_array
         frequencies = np.asarray(frequencies)
-        df = full_frequencies[1] - full_frequencies[0]
+        # the grid's spacing, without building the (full-band) grid
+        df = 1 / interferometer.duration
         above_minimum_frequency = frequencies > (interferometer.minimum_frequency - df)
         freqs = frequencies[above_minimum_frequency]
 
@@ -1496,7 +1496,9 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
 
             if injection is not None:
                 snr = np.sqrt(s_inner_s)
-                message = f"{interferometer.name}: injected optimal SNR {snr:.2f}"
+                message = (f"{interferometer.name}: <d|d>^(1/2) {snr:.2f}"
+                           if getattr(injection, "data", False)
+                           else f"{interferometer.name}: injected optimal SNR {snr:.2f}")
                 if injection.noise:
                     message += f", matched-filter SNR {(s_inner_s + s_inner_n.real) / snr:.2f}"
                 logger.info(message)
