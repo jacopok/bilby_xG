@@ -76,8 +76,12 @@ def test_noise_realisation_is_fixed_by_the_seed_alone():
     c = _likelihood(seed=4)
     for ifo in a.interferometers:
         for mode, expected in a.summary_data[ifo.name]["a0"].items():
+            # equal up to rounding amplified by the per-bin eigendecomposition
+            # of the noise covariance, which is singular here (the injection is
+            # the fiducial, so the signal is a combination of the basis
+            # functions): ~1e-9 of a bin in some bins
             np.testing.assert_allclose(b.summary_data[ifo.name]["a0"][mode], expected,
-                                       rtol=1e-10, atol=0)
+                                       rtol=1e-7, atol=1e-8 * np.abs(expected).max())
             assert not np.allclose(c.summary_data[ifo.name]["a0"][mode], expected)
 
 
