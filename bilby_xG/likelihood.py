@@ -43,6 +43,7 @@ from bilby.gw.likelihood import (
 from bilby.gw.utils import noise_weighted_inner_product
 
 from .conversion import TIME_OFFSET, TIME_ORIGIN, geocent_time
+from .distance_marginalization import QuadratureDistanceMarginalization
 from .interferometer import TIME_TO_MERGER_KEY
 from .injection import complex_gaussian
 from .motion import resolve_center
@@ -192,7 +193,8 @@ class _TimeOffset:
                     geocent_time=geocent_time(parameters))
 
 
-class GravitationalWaveTransientNextGeneration(_TimeOffset, GravitationalWaveTransient):
+class GravitationalWaveTransientNextGeneration(
+        _TimeOffset, QuadratureDistanceMarginalization, GravitationalWaveTransient):
     """Transient likelihood using the frequency-dependent antenna response.
 
     Identical to :class:`bilby.gw.likelihood.GravitationalWaveTransient` except
@@ -297,7 +299,8 @@ class GravitationalWaveTransientNextGeneration(_TimeOffset, GravitationalWaveTra
         return h
 
 
-class MBGravitationalWaveTransientNextGeneration(_TimeOffset, MBGravitationalWaveTransient):
+class MBGravitationalWaveTransientNextGeneration(
+        _TimeOffset, QuadratureDistanceMarginalization, MBGravitationalWaveTransient):
     """Multi-banded likelihood with a frequency-dependent antenna response.
 
     Combines the multi-banding of S. Morisaki (2021), arXiv:2104.07813 with the
@@ -428,7 +431,7 @@ class MBGravitationalWaveTransientNextGeneration(_TimeOffset, MBGravitationalWav
 
 
 class RelativeBinningGravitationalWaveTransientNextGeneration(
-        _TimeOffset, RelativeBinningGravitationalWaveTransient):
+        _TimeOffset, QuadratureDistanceMarginalization, RelativeBinningGravitationalWaveTransient):
     """A gravitational-wave transient likelihood object capaple of handling
     frequency-dependent antenna responses which uses the relative
     binning procedure to calculate a fast likelihood. See Zackay et al.
@@ -644,7 +647,7 @@ class RelativeBinningGravitationalWaveTransientNextGeneration(
 
 
 class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
-        _TimeOffset, GravitationalWaveTransient):
+        _TimeOffset, QuadratureDistanceMarginalization, GravitationalWaveTransient):
     """
     This modifies code written by Ish Gupta and others to implement the
     relative binning likelihood for the HM precessing model.
