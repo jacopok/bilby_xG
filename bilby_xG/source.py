@@ -1946,6 +1946,11 @@ _MLGW_BNS_ANGLES = {}
 _MLGW_BNS_ANGLES_SIZE = 8
 
 
+# evaluated on ``frequency_bin_edges`` alone when given: the waveform
+# generator then never builds the full-band frequency array for it
+mlgw_bns_individual_modes.evaluates_on_bin_edges = True
+
+
 def _check_mlgw_bns_modes(mode_array):
     modes = [(int(ell), int(emm)) for ell, emm in mode_array]
     unknown = [mode for mode in modes if mode not in MLGW_BNS_MODES]
@@ -2105,6 +2110,11 @@ def mlgw_bns_precessing_individual_modes(frequency_array, M, q, a_1, a_2, tilt_1
     return polarizations
 
 
+# evaluated on ``frequency_bin_edges`` alone when given: the waveform
+# generator then never builds the full-band frequency array for it
+mlgw_bns_precessing_individual_modes.evaluates_on_bin_edges = True
+
+
 def _evaluate_precessing(function, frequencies, start, intrinsic, *arguments, angles=None):
     """``function`` (a :func:`mlgw_bns_precessing_components`) for one binary
     at ``frequencies``, in pieces padded to one of
@@ -2255,3 +2265,10 @@ def teobresums_spa_individual_modes(frequency_array, M, q, chi1z, chi2z,
             np.pi / 2.0 - coalescence_angle, inclination)
         out[f"{ell},{emm}"] = {"plus": plus * phasor, "cross": cross * phasor}
     return out
+
+
+# evaluated on ``frequency_bin_edges`` alone when given: the waveform
+# generator then never builds the full-band frequency array for it
+teobresums_spa_individual_modes.evaluates_on_bin_edges = True
+
+

@@ -57,11 +57,26 @@ class WaveformGenerator(_WaveformGenerator):
             self.time_array if self.time_domain_source_model is not None else None)
         return self._calculate_strain(
             model=self.frequency_domain_source_model,
-            model_data_points=self.frequency_array,
+            model_data_points=self._model_frequencies(),
             parameters=parameters,
             transformation_function=utils.nfft,
             transformed_model=self.time_domain_source_model,
             transformed_model_data_points=transformed_model_data_points)
+
+    def _model_frequencies(self):
+        """The frequencies handed to the frequency-domain source model: its
+        ``frequency_bin_edges`` waveform argument when the model evaluates
+        on those alone (``evaluates_on_bin_edges``, the mlgw_bns and
+        TEOBResumS-SPA sources), else ``frequency_array``. Every
+        relative-binning evaluation of those sources would otherwise build
+        the full-band array (``duration * sampling_frequency / 2`` points,
+        ~1 GB at ET's 3 Hz) in each process that evaluates the likelihood
+        (each worker of an unbatched sampler's pool), to be ignored."""
+        edges = self.waveform_arguments.get("frequency_bin_edges")
+        if edges is not None and getattr(self.frequency_domain_source_model,
+                                         "evaluates_on_bin_edges", False):
+            return edges
+        return self.frequency_array
 
     def time_domain_strain(self, parameters=None):
         transformed_model_data_points = (
