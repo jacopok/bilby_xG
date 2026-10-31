@@ -90,6 +90,41 @@ def nested_sampling_resolution(d, effective_dimension, n_live):
     return 2 * np.asarray(d) / (effective_dimension * n_live)
 
 
+#: tails of the Gamma(D_eff / 2) distribution of d outside the posterior's range
+POSTERIOR_TAIL = 1e-6
+#: beyond the posterior, |error| / d above this risks a spurious peak
+SPURIOUS_PEAK_FRACTION = 0.1
+
+
+def posterior_range(effective_dimension, tail=POSTERIOR_TAIL):
+    """The range of ln L_max - ln L of the posterior: Gamma(D_eff / 2)
+    quantiles ``tail`` and 1 - ``tail``."""
+    return (float(gamma.ppf(tail, effective_dimension / 2)),
+            float(gamma.isf(tail, effective_dimension / 2)))
+
+
+def error_diagnostics(d, errors, effective_dimension, n_live):
+    """(max |error| / NS resolution within the posterior's range of d,
+    max |error| / d beyond it).
+
+    A deterministic error makes nested sampling integrate a slightly
+    different likelihood, exactly: the evidence moves only through the
+    errors where the posterior is, which are compared with the dead-point
+    spacing there. Farther out the spacing is irrelevant (those points carry
+    no weight); the error only matters if it brings a point near the peak,
+    i.e. is a sizeable fraction of d. Closer to the peak than the posterior
+    (where the errors are at the quadrature noise floor) there is no weight
+    either."""
+    d, errors = np.asarray(d), np.abs(np.asarray(errors))
+    d_lo, d_hi = posterior_range(effective_dimension)
+    inside = (d >= d_lo) & (d <= d_hi)
+    outside = d > d_hi
+    ratio = float(np.max(errors[inside] / nested_sampling_resolution(
+        d[inside], effective_dimension, n_live), initial=0))
+    relative = float(np.max(errors[outside] / d[outside], initial=0))
+    return ratio, relative
+
+
 def sampled_parameter_count(priors):
     """Parameters of a PriorDict that are sampled: not fixed, not constraints."""
     from bilby.core.prior import Constraint, DeltaFunction
@@ -676,25 +711,28 @@ def select_relative_binning_bins(
               for (_, b, a), p in zip(scan_tasks, scan_points)],
         wall_time=time.time() - t_start)
     scan_d = np.array([-p.delta_log_likelihood for p in scan_points])
+    d_lo, d_hi = summary["posterior_range"] = posterior_range(effective_dimension)
     for label, s in summary["sets"].items():
         v = np.abs(s["validation"])
-        # ratio to the nested-sampling resolution; d < 0.01 is left out, where
-        # both are at the quadrature noise floor
-        d = np.concatenate([evidence_d, scan_d])
-        e = np.abs(np.concatenate([s["evidence"], s["scan"]]))
-        keep = d > 0.01
         s["evidence_bias"] = evidence_bias(s["evidence"])
-        s["max_resolution_ratio"] = float(np.max(
-            e[keep] / nested_sampling_resolution(d[keep], effective_dimension, n_live)))
+        s["max_resolution_ratio"], s["max_relative_error"] = error_diagnostics(
+            np.concatenate([evidence_d, scan_d]), np.concatenate([s["evidence"], s["scan"]]),
+            effective_dimension, n_live)
         logger.info(f"Bin selection: {label}: {s['n_bins']} bins, validation |error| "
                     f"max {v.max():.3g}, median {np.median(v):.3g}; evidence bias "
-                    f"{s['evidence_bias']:.3g}; max |error| / NS resolution "
-                    f"{s['max_resolution_ratio']:.3g}")
-    ratio = summary["sets"][next(iter(sets))]["max_resolution_ratio"]
-    if ratio > 1:
-        logger.warning(f"Bin selection: the error exceeds the nested-sampling resolution "
-                       f"2 d / (D_eff n_live) by up to {ratio:.3g}x (D_eff = "
+                    f"{s['evidence_bias']:.3g}; max |error| / NS resolution for d in "
+                    f"[{d_lo:.3g}, {d_hi:.3g}]: {s['max_resolution_ratio']:.3g}; max |error| / d beyond: "
+                    f"{s['max_relative_error']:.3g}")
+    first = summary["sets"][next(iter(sets))]
+    if first["max_resolution_ratio"] > 1:
+        logger.warning(f"Bin selection: within the posterior (d in [{d_lo:.3g}, {d_hi:.3g}]), the error "
+                       f"exceeds the nested-sampling resolution 2 d / (D_eff n_live) by up "
+                       f"to {first['max_resolution_ratio']:.3g}x (D_eff = "
                        f"{effective_dimension:g}, n_live = {n_live})")
+    if first["max_relative_error"] > SPURIOUS_PEAK_FRACTION:
+        logger.warning(f"Bin selection: beyond the posterior (d > {d_hi:.3g}), the error "
+                       f"reaches {first['max_relative_error']:.3g} of d: risk of spurious "
+                       f"peaks")
 
     if outdir is not None:
         os.makedirs(outdir, exist_ok=True)
@@ -770,6 +808,13 @@ def plot_bin_selection(summary, outdir):
                       rf"$D_{{\rm eff}}$ = {dim:g}, $n_{{\rm live}}$ = {n_live}")
         ax.axvspan(*gamma.ppf([0.01, 0.99], dim / 2), color="gray", alpha=0.12,
                    label=r"posterior 98% of $d$, Gamma($D_{\rm eff}$/2)")
+        if "posterior_range" in summary:
+            for k, d_edge in enumerate(summary["posterior_range"]):
+                ax.axvline(d_edge, color="gray", ls=":", lw=1.2,
+                           label=None if k else rf"posterior range of $d$ (tails "
+                                 rf"{POSTERIOR_TAIL:g}): resolution checked within")
+            ax.plot(centres, SPURIOUS_PEAK_FRACTION * centres, "k:", lw=1.2,
+                    label=rf"{SPURIOUS_PEAK_FRACTION:g} $d$: checked beyond")
     ax.set(xscale="log", yscale="log", xlabel=r"$d = \ln L_{\max} - \ln L$",
            ylabel=r"$|\ln L_{\rm RB} - \ln L|$",
            title="Error vs. distance from the peak (lines: max per bin; filled: phase-\n"

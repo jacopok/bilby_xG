@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 from scipy.stats import gamma
 
-from bilby_xG.bin_selection import (evidence_bias, nested_sampling_resolution,
+from bilby_xG.bin_selection import (error_diagnostics, evidence_bias,
+                                    nested_sampling_resolution, posterior_range,
                                     sampled_parameter_count)
 
 
@@ -24,6 +25,23 @@ def test_nested_sampling_resolution():
     # Gaussian L(X): d ln L / d ln X = 2 d / D, one dead point per ln X step 1 / n_live
     d = np.array([0.5, 5.5, 50])
     assert np.allclose(nested_sampling_resolution(d, 11, 1000), 2 * d / 11e3)
+
+
+def test_error_diagnostics_split_at_the_posterior_range():
+    dim, n_live = 13, 5000
+    d_lo, d_post = posterior_range(dim)
+    assert gamma.cdf(d_lo, dim / 2) == pytest.approx(1e-6)
+    assert gamma.sf(d_post, dim / 2) == pytest.approx(1e-6)
+    # closer to the peak than the posterior: the noise floor, not checked
+    d = np.array([0.5 * d_lo, 5.0, d_post, 3e4])
+    resolution = nested_sampling_resolution(d, dim, n_live)
+    # far from the peak, an error far above the resolution is only a small fraction of d
+    errors = np.array([1.0, 0.5 * resolution[1], 0.8 * resolution[2], 300.0])
+    ratio, relative = error_diagnostics(d, -errors, dim, n_live)
+    assert ratio == pytest.approx(0.8)
+    assert relative == pytest.approx(0.01)
+    # nothing beyond the posterior
+    assert error_diagnostics(d[:3], errors[:3], dim, n_live)[1] == 0
 
 
 def test_sampled_parameter_count():
