@@ -239,3 +239,43 @@ def test_truncated_mixture_likelihood(likelihoods):
                                rtol=1e-10, atol=1e-8)
     with pytest.raises(ValueError):
         BatchedTruncatedMixtureLikelihood(numpy_likelihood, [n_bins, n_bins // 2], [0, 0])
+
+
+def test_batched_model_constraint_with_fixed_parameters():
+    """A Constraint (here on the total mass) with fixed parameters among the
+    model's: bilby's evaluate_constraints sizes its product from the first
+    value, a scalar fixed parameter, and failed on a batch."""
+    import bilby
+    from bilby.gw.conversion import generate_mass_parameters
+
+    from bilby_xG.batched import BatchedBilbyModelLikelihoodConstraint
+
+    def conversion(sample):
+        sample = dict(sample)
+        sample.update(generate_mass_parameters(sample))
+        return sample
+
+    class Likelihood(bilby.core.likelihood.Likelihood):
+        batch_size = 4
+
+        def log_likelihood_ratio(self, parameters=None):
+            return -np.asarray(parameters["chirp_mass"]) - parameters["phase"]
+
+    priors = bilby.core.prior.PriorDict(conversion_function=conversion)
+    priors["phase"] = 0.5
+    priors["chirp_mass"] = bilby.core.prior.Uniform(1.6, 1.8)
+    priors["mass_ratio"] = bilby.core.prior.Uniform(0.5, 1)
+    priors["total_mass"] = bilby.core.prior.Constraint(minimum=0, maximum=4)
+    model = BatchedBilbyModelLikelihoodConstraint(
+        priors=priors, likelihood=Likelihood(), use_ratio=True)
+    x = model.new_point(N=64)
+    x["chirp_mass"][:2] = 1.7
+    x["mass_ratio"][:2] = [1.0, 0.5]  # total mass 3.9 and 4.2
+    total = generate_mass_parameters(
+        dict(chirp_mass=x["chirp_mass"], mass_ratio=x["mass_ratio"]))["total_mass"]
+    got = model.log_likelihood(x)
+    assert got.shape == (64,)
+    assert np.all(np.isfinite(got[total <= 4])) and np.all(got[total > 4] == -np.inf)
+    assert np.isfinite(got[0]) and got[1] == -np.inf
+    np.testing.assert_allclose(model.log_likelihood(x[0]), -1.7 - 0.5)
+    assert model.log_likelihood(x[1]) == -np.inf

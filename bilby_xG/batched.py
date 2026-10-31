@@ -568,9 +568,23 @@ def _batched_bilby_model_classes():
         """As :class:`BatchedBilbyModel`, with the prior constraints in the
         likelihood."""
 
+        def _allowed(self, theta, shape):
+            """Whether each point satisfies the priors' constraints. bilby's
+            PriorDict.evaluate_constraints takes its shape from the first
+            value of the converted sample, here a (scalar) fixed parameter,
+            and its in-place product with a batch's constraint fails."""
+            from bilby.core.prior import Constraint
+
+            converted = self.bilby_priors.conversion_function(dict(theta))
+            allowed = np.ones(shape, dtype=bool)
+            for key, prior in self.bilby_priors.items():
+                if isinstance(prior, Constraint) and key in converted:
+                    allowed = allowed & (np.asarray(prior.prob(converted[key])) > 0)
+            return allowed
+
         def log_likelihood(self, x):
             theta = self._theta(x)
-            allowed = np.atleast_1d(self.bilby_priors.evaluate_constraints(theta))
+            allowed = np.atleast_1d(self._allowed(theta, np.shape(x)))
             out = np.atleast_1d(self.bilby_log_likelihood_fn(theta))
             out = np.where(allowed, out, -np.inf)
             return out.reshape(np.shape(x)) if np.ndim(x) else out[0]
