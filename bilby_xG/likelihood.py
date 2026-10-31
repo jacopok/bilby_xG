@@ -44,6 +44,8 @@ from bilby.gw.utils import noise_weighted_inner_product
 
 from .conversion import TIME_OFFSET, TIME_ORIGIN, geocent_time
 from .distance_marginalization import QuadratureDistanceMarginalization
+from .grid import FrequencyGrid
+from .waveform_generator import source_frequency_array
 from .interferometer import TIME_TO_MERGER_KEY
 from .injection import complex_gaussian
 from .motion import resolve_center
@@ -170,6 +172,44 @@ def relative_binning_bin_freqs(frequency_array, minimum_frequency, maximum_frequ
     unique_bin_indices = np.unique(bin_indices)
 
     return frequency_array_useful[unique_bin_indices]
+
+
+def relative_binning_bin_freqs_on_grid(grid, minimum_frequency, maximum_frequency,
+                                       chi=1, epsilon=0.5, gamma=None, chunk_size=2 ** 20):
+    """:func:`relative_binning_bin_freqs` on the data's frequency grid
+    (a :class:`~bilby_xG.grid.FrequencyGrid`), identically, a chunk of
+    ``chunk_size`` frequencies at a time: d_phi increases with frequency, so
+    each bin edge is placed within the chunk where d_phi passes it."""
+    if gamma is None:
+        gamma = _DEFAULT_GAMMA
+    gamma = gamma[:, np.newaxis]
+    start, stop = grid.band(minimum_frequency, maximum_frequency)
+    d_alpha = chi * 2 * np.pi / np.abs(
+        (minimum_frequency ** gamma) * np.heaviside(-gamma, 1)
+        - (maximum_frequency ** gamma) * np.heaviside(gamma, 1)
+    )
+
+    def d_phi(frequencies):
+        return np.sum(np.sign(gamma) * d_alpha * frequencies ** gamma, axis=0)
+
+    first = d_phi(grid.frequencies(start, start + 1))[0]
+    total = d_phi(grid.frequencies(stop - 1, stop))[0] - first
+    number_of_bins = int(total // epsilon)
+    bin_edges = np.linspace(0, total, num=number_of_bins + 1)
+    bin_indices = np.full(len(bin_edges), stop - start - 1)
+    resolved = 0
+    for a, b in grid.chunks(start, stop, chunk_size):
+        d_phi_from_start = d_phi(grid.frequencies(a, b)) - first
+        # the edges at or below this chunk's last d_phi (and above the
+        # previous chunk's) are first reached in this chunk
+        upto = int(np.searchsorted(bin_edges, d_phi_from_start[-1], side="right"))
+        if upto > resolved:
+            bin_indices[resolved:upto] = a - start + np.searchsorted(
+                d_phi_from_start, bin_edges[resolved:upto])
+            resolved = upto
+        if resolved == len(bin_edges):
+            break
+    return grid.at(start + np.unique(bin_indices))
 
 
 class _TimeOffset:
@@ -911,7 +951,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         self.epsilon = epsilon
         self.gamma = np.array([-5 / 3, -2 / 3, 1, 5 / 3, 7 / 3])
         self.precomputed_bin_freqs = None if bin_freqs is None else np.asarray(bin_freqs)
-        self.maximum_frequency = waveform_generator.frequency_array[-1]
+        self.maximum_frequency = FrequencyGrid.of(waveform_generator).maximum
         self.fiducial_waveform_obtained = False
         self.check_if_bins_are_setup = False
         self.earth_rotation_time_delay = earth_rotation_time_delay
@@ -984,44 +1024,50 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         spacing of the data. We require that bins are at least as wide as
         this spacing.
         """
-        frequency_array = self.waveform_generator.frequency_array
+        # the data's frequency grid, by index (never the full-band array)
+        grid = FrequencyGrid.of(self.waveform_generator)
         # Bin over the intersection of the interferometer frequency ranges,
         # matching bilby's RelativeBinningGravitationalWaveTransient.setup_bins.
         minimum_frequency = np.maximum.reduce(
             [ifo.minimum_frequency for ifo in self.interferometers], initial=0)
         maximum_frequency = np.minimum.reduce(
-            [ifo.maximum_frequency for ifo in self.interferometers], initial=frequency_array[-1])
+            [ifo.maximum_frequency for ifo in self.interferometers], initial=grid.maximum)
         maximum_frequency = min(maximum_frequency, self.maximum_frequency)
 
         if self.precomputed_bin_freqs is not None:
-            ref_freqs = frequency_array[
-                (frequency_array >= minimum_frequency) & (frequency_array <= maximum_frequency)]
+            # ref_freqs, the in-band grid, is grid.frequencies(start, stop)
+            start, stop = grid.band(minimum_frequency, maximum_frequency)
+
+            def ref_freqs(indices):
+                return grid.at(start + np.asarray(indices))
+
             inner = self.precomputed_bin_freqs[
-                (self.precomputed_bin_freqs > ref_freqs[0])
-                & (self.precomputed_bin_freqs < ref_freqs[-1])]
+                (self.precomputed_bin_freqs > ref_freqs(0))
+                & (self.precomputed_bin_freqs < ref_freqs(stop - start - 1))]
             indices = np.unique(np.concatenate(
-                [[0], np.searchsorted(ref_freqs, inner), [len(ref_freqs) - 1]]))
+                [[0], grid.searchsorted(inner) - start, [stop - start - 1]]))
             # an inner edge right at the band's end (the given edges may end
             # slightly below this likelihood's maximum frequency) would leave
             # a sliver bin: merge it into its neighbour
-            if len(indices) > 2 and ref_freqs[indices[-1]] - ref_freqs[indices[-2]] < 0.01 * (
-                    ref_freqs[indices[-2]] - ref_freqs[indices[-3]]):
+            if len(indices) > 2 and ref_freqs(indices[-1]) - ref_freqs(indices[-2]) < 0.01 * (
+                    ref_freqs(indices[-2]) - ref_freqs(indices[-3])):
                 indices = np.delete(indices, -2)
-            if len(indices) > 2 and ref_freqs[indices[1]] - ref_freqs[indices[0]] < 0.01 * (
-                    ref_freqs[indices[2]] - ref_freqs[indices[1]]):
+            if len(indices) > 2 and ref_freqs(indices[1]) - ref_freqs(indices[0]) < 0.01 * (
+                    ref_freqs(indices[2]) - ref_freqs(indices[1])):
                 indices = np.delete(indices, 1)
-            bin_freqs = ref_freqs[indices]
+            bin_freqs = ref_freqs(indices)
             selection_description = (
                 f"precomputed, {len(self.precomputed_bin_freqs) - 1} bins given")
         else:
-            bin_freqs = relative_binning_bin_freqs(
-                frequency_array, minimum_frequency, maximum_frequency,
-                chi=self.chi, epsilon=self.epsilon, gamma=self.gamma)
+            bin_freqs = relative_binning_bin_freqs_on_grid(
+                grid, minimum_frequency, maximum_frequency,
+                chi=self.chi, epsilon=self.epsilon, gamma=self.gamma,
+                chunk_size=self.summary_data_chunk_size)
             selection_description = (
                 f"epsilon={self.epsilon}, chi={self.chi}, "
                 f"gamma={self.gamma.tolist()}")
 
-        bin_inds = np.searchsorted(frequency_array, bin_freqs)
+        bin_inds = grid.searchsorted(bin_freqs)
         self.bin_inds = bin_inds
         self.bin_freqs = bin_freqs
         self.number_of_bins = len(bin_inds) - 1
@@ -1094,7 +1140,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         waveform_arguments["frequency_bin_edges"] = np.asarray(frequencies)
         source_parameters.update(waveform_arguments)
         polarizations = wfg.frequency_domain_source_model(
-            wfg.frequency_array, **source_parameters)
+            source_frequency_array(wfg, frequencies), **source_parameters)
         return polarizations[mode_key]
 
     def _legacy_fiducial_modes(self, converted_parameters):
@@ -1148,17 +1194,17 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         waveform model's hard high-frequency cut-off) without its historical
         off-by-``minimum_frequency`` indexing error.
         """
-        frequency_array = self.waveform_generator.frequency_array
-        df = frequency_array[1] - frequency_array[0]
+        grid = FrequencyGrid.of(self.waveform_generator)
         minimum_frequency = min(ifo.minimum_frequency for ifo in self.interferometers)
-        search_frequencies = frequency_array[frequency_array > (minimum_frequency - df)]
+        # the grid above minimum_frequency - df
+        first = int(grid.searchsorted(minimum_frequency - grid.step, side="right"))
 
         per_mode_maxima = []
         for ell, emm in self.mode_array:
             mode_key = f"{ell},{emm}"
             last_nonzero_frequency = None
-            for start in range(0, len(search_frequencies), self.summary_data_chunk_size):
-                chunk = search_frequencies[start:start + self.summary_data_chunk_size]
+            for start, stop in grid.chunks(first, grid.size, self.summary_data_chunk_size):
+                chunk = grid.frequencies(start, stop)
                 plus = self._fiducial_mode_polarizations(
                     converted_parameters, mode_key, chunk)["plus"]
                 nonzero = np.nonzero(plus)[0]
@@ -1330,6 +1376,23 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
             yield start, end
             start = end
 
+    def _summary_data_pieces(self, masked_bin_inds):
+        """Yield ``(start_bin, end_bin, lo, hi)``: the bins of each
+        :meth:`_bin_chunks` group and the in-band index range ``[lo, hi)``
+        to evaluate them on at once, at most ``summary_data_chunk_size``
+        samples, except that a group of one bin wider than that comes as
+        several pieces of it (consecutive, in order), whose contributions
+        the summary data add up: memory stays bounded however long the
+        signal, and a bin within a chunk is computed as before."""
+        size = self.summary_data_chunk_size
+        for start, end in self._bin_chunks(masked_bin_inds):
+            lo, hi = int(masked_bin_inds[start]), int(masked_bin_inds[end])
+            if end - start > 1 or hi - lo <= size:
+                yield start, end, lo, hi
+                continue
+            for piece_lo in range(lo, hi, size):
+                yield start, end, piece_lo, min(piece_lo + size, hi)
+
     def compute_summary_data(self):
         """Compute summary data for the likelihood.
 
@@ -1376,18 +1439,31 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                 'b2': dict()
             }
 
-            mask = interferometer.frequency_mask
-            n_in_band = int(np.count_nonzero(mask))
-            raw_offset = int(np.argmax(mask))
-            raw_last = len(mask) - 1 - int(np.argmax(mask[::-1]))
-            is_contiguous = (raw_last - raw_offset + 1) == n_in_band
-            # Only materialise the full index array (an O(1e8)-element int
-            # allocation at ET's low minimum_frequency) in the fallback case;
-            # the masks this pipeline uses (a single [minimum_frequency,
-            # maximum_frequency] band) are always contiguous.
-            in_band_indices = None if is_contiguous else np.flatnonzero(mask)
-            masked_frequency_array = interferometer.frequency_array[mask]
-            masked_bin_inds = np.searchsorted(masked_frequency_array, self.bin_freqs)
+            # the in-band frequencies, bilby's frequency_mask: without
+            # notches, the grid's [minimum_frequency, maximum_frequency]
+            # index range, walked a chunk at a time (no full-band array, so
+            # memory does not grow with the duration); with notches, the
+            # mask itself (full band)
+            grid = FrequencyGrid.of(interferometer.strain_data)
+            if interferometer.strain_data.notch_list:
+                mask = interferometer.frequency_mask
+                in_band_indices = np.flatnonzero(mask)
+                masked_frequency_array = grid.at(in_band_indices)
+                raw_offset = None
+
+                def in_band(lo, hi):
+                    return masked_frequency_array[lo:hi]
+
+                masked_bin_inds = np.searchsorted(masked_frequency_array, self.bin_freqs)
+            else:
+                raw_offset, _ = grid.band(interferometer.minimum_frequency,
+                                          interferometer.maximum_frequency)
+                in_band_indices = None
+
+                def in_band(lo, hi):
+                    return grid.frequencies(raw_offset + lo, raw_offset + hi)
+
+                masked_bin_inds = grid.searchsorted(self.bin_freqs) - raw_offset
             duration = interferometer.duration
             raw_strain = (None if injection is not None
                           else interferometer.strain_data._frequency_domain_strain)
@@ -1416,10 +1492,10 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                     (b0[key][f'{ellp},{emmp}'], b1[key][f'{ellp},{emmp}'],
                      b2[key][f'{ellp},{emmp}']) = np.zeros((3, self.number_of_bins), dtype=complex)
 
-            for chunk_start, chunk_end in self._bin_chunks(masked_bin_inds):
-                chunk_lo = masked_bin_inds[chunk_start]
-                chunk_hi = masked_bin_inds[chunk_end]
-                chunk_frequencies = masked_frequency_array[chunk_lo:chunk_hi]
+            gram = dict()
+            for chunk_start, chunk_end, chunk_lo, chunk_hi in self._summary_data_pieces(
+                    masked_bin_inds):
+                chunk_frequencies = in_band(chunk_lo, chunk_hi)
                 chunk_psd = (
                     psd_model.get_power_spectral_density_array(chunk_frequencies)
                     * window_power_correction)
@@ -1435,7 +1511,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                                        if abs(emm) in LEGACY_INJECTION_M)
                 elif raw_strain is None:
                     chunk_strain = injection.signal(interferometer, chunk_frequencies)
-                elif is_contiguous:
+                elif in_band_indices is None:
                     chunk_strain = raw_strain[
                         raw_offset + chunk_lo:raw_offset + chunk_hi]
                 else:
@@ -1449,8 +1525,12 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                     f"{chunk_frequencies[-1]:.3g}] Hz.")
 
                 for i in range(chunk_start, chunk_end):
-                    idxs = slice(masked_bin_inds[i] - chunk_lo,
-                                 masked_bin_inds[i + 1] - chunk_lo)
+                    # the part of bin i in this piece (all of it, unless the
+                    # bin is wider than a chunk and split into pieces)
+                    bin_lo, bin_hi = masked_bin_inds[i], masked_bin_inds[i + 1]
+                    idxs = slice(max(bin_lo, chunk_lo) - chunk_lo,
+                                 min(bin_hi, chunk_hi) - chunk_lo)
+                    bin_complete = bin_hi <= chunk_hi
 
                     frequencies = chunk_frequencies[idxs]
                     # the centre the ratios' r0 refer to (the midpoint of the
@@ -1459,7 +1539,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                     # it which more bins do not reduce (legacy: the fork's,
                     # the samples' midpoint)
                     if self.legacy:
-                        delta_frequency = frequencies - (frequencies[0] + frequencies[-1]) / 2
+                        delta_frequency = frequencies - (
+                            in_band(bin_lo, bin_lo + 1)[0] + in_band(bin_hi - 1, bin_hi)[0]) / 2
                     else:
                         delta_frequency = frequencies - self.bin_centers[i]
 
@@ -1469,15 +1550,15 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                     for j, (ell, emm) in enumerate(self.mode_array):
                         key = f'{ell},{emm}'
                         h0 = chunk_h0[key][idxs]
-                        a0[key][i] = noise_weighted_inner_product(h0, strain, psd, duration)
-                        a1[key][i] = noise_weighted_inner_product(h0, strain * delta_frequency, psd, duration)
+                        a0[key][i] += noise_weighted_inner_product(h0, strain, psd, duration)
+                        a1[key][i] += noise_weighted_inner_product(h0, strain * delta_frequency, psd, duration)
 
                         for ellp, emmp in self.mode_array[j::]:
                             keyp = f'{ellp},{emmp}'
                             h0_p = chunk_h0[keyp][idxs]
-                            b0[key][keyp][i] = noise_weighted_inner_product(h0_p, h0, psd, duration)
-                            b1[key][keyp][i] = noise_weighted_inner_product(h0_p, h0 * delta_frequency, psd, duration)
-                            b2[key][keyp][i] = noise_weighted_inner_product(
+                            b0[key][keyp][i] += noise_weighted_inner_product(h0_p, h0, psd, duration)
+                            b1[key][keyp][i] += noise_weighted_inner_product(h0_p, h0 * delta_frequency, psd, duration)
+                            b2[key][keyp][i] += noise_weighted_inner_product(
                                 h0_p * delta_frequency, h0 * delta_frequency, psd, duration)
 
                     if injection is None:
@@ -1490,8 +1571,11 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                     basis = np.concatenate([h0s, h0s * delta_frequency, strain[None]])
                     # gram[i, j] = <g_i | g_j>; the noise terms <g_i | n> have
                     # E[x_i x_j^*] = 2 gram[i, j] for bilby's noise normalisation
-                    gram = 4 / duration * (basis.conj() / psd) @ basis.T
-                    noise = complex_gaussian(2 * gram, z[i])
+                    piece_gram = 4 / duration * (basis.conj() / psd) @ basis.T
+                    gram[i] = piece_gram if i not in gram else gram[i] + piece_gram
+                    if not bin_complete:
+                        continue
+                    noise = complex_gaussian(2 * gram.pop(i), z[i])
                     for j, (ell, emm) in enumerate(self.mode_array):
                         a0[f'{ell},{emm}'][i] += noise[j]
                         a1[f'{ell},{emm}'][i] += noise[n_modes + j]
@@ -1537,9 +1621,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
             # accumulate across detectors instead of each one's being
             # released once its summary data is done.
             interferometer.discard_regenerable_frequency_caches()
-            del mask, masked_frequency_array, masked_bin_inds, raw_strain
-            if in_band_indices is not None:
-                del in_band_indices
+            del masked_bin_inds, raw_strain, in_band_indices, in_band
 
         self.summary_data = summary_data
         if injection is not None:

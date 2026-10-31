@@ -58,6 +58,7 @@ from scipy.special import logsumexp
 from scipy.stats import gamma
 
 from .motion import resolve_center
+from .waveform_generator import source_frequency_array
 
 CHUNK_SIZE = 250_000
 
@@ -178,7 +179,8 @@ class Projector:
         source_parameters["fiducial"] = 0
         source_parameters.update(wfg.waveform_arguments)
         source_parameters["frequency_bin_edges"] = np.asarray(freqs)
-        return wfg.frequency_domain_source_model(wfg.frequency_array, **source_parameters)
+        return wfg.frequency_domain_source_model(
+            source_frequency_array(wfg, freqs), **source_parameters)
 
     def project(self, parameters, freqs):
         """Detector strain, shape (n_ifo, n_mode, n_freq)."""

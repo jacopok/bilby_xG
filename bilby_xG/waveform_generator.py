@@ -20,10 +20,24 @@ relative-binning likelihood's ``.pickle`` on disk, a sampler's worker-pool
 in reverse (evaluates ``frequency_array`` unconditionally) -- overridden
 symmetrically even though bilby_xG never calls it.
 """
+import numpy as np
 from bilby.core import utils
 from bilby.gw.waveform_generator import WaveformGenerator as _WaveformGenerator
 
 __author__ = ["Pratyusava Baral <pbaral@uwm.edu>", "Soichiro Morisaki"]
+
+
+def source_frequency_array(waveform_generator, frequencies):
+    """The ``frequency_array`` to hand the source model when it is evaluated
+    at ``frequencies`` through its ``frequency_bin_edges`` argument: those
+    frequencies themselves for the models that evaluate on the edges alone
+    (``evaluates_on_bin_edges``), else the full-band grid, which the other
+    models read (e.g. the LAL ones' default maximum frequency) and which
+    costs O(duration) memory in every process that builds it."""
+    if getattr(waveform_generator.frequency_domain_source_model,
+               "evaluates_on_bin_edges", False):
+        return np.asarray(frequencies)
+    return waveform_generator.frequency_array
 
 
 class WaveformGenerator(_WaveformGenerator):
@@ -73,10 +87,9 @@ class WaveformGenerator(_WaveformGenerator):
         ~1 GB at ET's 3 Hz) in each process that evaluates the likelihood
         (each worker of an unbatched sampler's pool), to be ignored."""
         edges = self.waveform_arguments.get("frequency_bin_edges")
-        if edges is not None and getattr(self.frequency_domain_source_model,
-                                         "evaluates_on_bin_edges", False):
-            return edges
-        return self.frequency_array
+        if edges is None:
+            return self.frequency_array
+        return source_frequency_array(self, edges)
 
     def time_domain_strain(self, parameters=None):
         transformed_model_data_points = (

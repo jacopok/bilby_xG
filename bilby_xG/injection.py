@@ -27,6 +27,7 @@ import numpy as np
 from bilby.core.utils import logger
 from bilby.gw.utils import noise_weighted_inner_product
 from bilby.core.series import CoupledTimeAndFrequencySeries
+from .grid import FrequencyGrid
 from .motion import resolve_center
 
 #: Frequency samples per chunk; the same default as the relative-binning
@@ -143,11 +144,11 @@ class SummaryDataInjection:
 
     def optimal_snr_squared(self, interferometer, chunk_size=DEFAULT_CHUNK_SIZE):
         """<s|s> over the analysis band, in chunks."""
-        freqs = _band(self.waveform_generator, self.minimum_frequency,
-                      self.maximum_frequency)
+        grid = FrequencyGrid.of(self.waveform_generator)
         total = 0.0
-        for i in range(0, len(freqs), chunk_size):
-            f = freqs[i:i + chunk_size]
+        for a, b in grid.chunks(*grid.band(self.minimum_frequency, self.maximum_frequency),
+                                chunk_size):
+            f = grid.frequencies(a, b)
             s = self.signal(interferometer, f)
             psd = interferometer.power_spectral_density.get_power_spectral_density_array(f)
             total += noise_weighted_inner_product(
