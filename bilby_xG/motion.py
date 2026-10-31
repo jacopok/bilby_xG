@@ -52,10 +52,22 @@ detector-frame masses (and the luminosity distance) by a Doppler factor.
 With the orbital motion, they are those of the Solar-System barycentre;
 without it, those of a frame comoving with the geocentre at coalescence,
 smaller by :func:`doppler_factor` (a :math:`\\sim 10^{-4}` effect). The
-choice of center does not change this. The motion enters through the
-arrival time only: the corresponding :math:`O(v/c)` amplitude and
+choice of center's position does not change this. The motion enters through
+the arrival time only: the corresponding :math:`O(v/c)` amplitude and
 :math:`O(v^2/c^2)` phase terms are, for a uniform motion, absorbed by the
 same rescaling, and their variation over a signal is negligible.
+
+A :class:`Center` can also carry a constant ``velocity`` :math:`\\mathbf{V}`:
+the detectors' positions are then taken relative to a frame moving with it,
+:math:`\\mathbf{R}_d(t_f) - \\mathbf{V}(t_f - t_c)`, so that only the
+departure of their motion from :math:`\\mathbf{V}` enters the delay, and
+the detector-frame masses and luminosity distance are those of that frame:
+the barycentric ones divided by :math:`1 + \\hat{n}\\cdot\\mathbf{V}/c`
+(:func:`frame_doppler_factor`). With :math:`\\mathbf{V}` the best uniform
+approximation of the detectors' motion over the signal
+(:func:`fit_frame_velocity`), these masses are what the data measure,
+independently of the sky position, whereas the barycentric ones vary over
+the sky by up to :math:`2|\\mathbf{V}|/c \\sim 2\\times 10^{-4}`.
 
 Ephemeris
 ---------
@@ -246,7 +258,9 @@ def greenwich_mean_sidereal_times(gps_times, time):
 
 
 class Center:
-    """The point the arrival time (``geocent_time``) refers to.
+    """The frame of the parameters: the point the arrival time
+    (``geocent_time``) refers to, and the velocity of the frame whose masses
+    and luminosity distance are the parameters' (none: the barycentre's).
 
     Either a point moving with the Earth, ``offset`` metres from the
     geocentre in Earth-fixed coordinates (the geocentre itself, a detector
@@ -261,29 +275,47 @@ class Center:
     as the arrival time at the center. The choice of center only changes
     the meaning of the time parameter (and not the masses); signals and
     likelihoods are the same up to that relabelling.
+
+    With a ``velocity`` (m/s, ICRS axes, constant) the detectors' positions
+    are taken relative to a frame moving with it and passing through the
+    center at coalescence (see the module's notes), which needs the orbital
+    motion. Only the masses and luminosity distance change meaning, by the
+    factor :func:`frame_doppler_factor` of the velocity, and with them any
+    parameter given at a reference frequency, such as a precessing
+    waveform's phase.
     """
 
-    def __init__(self, offset=None, position=None, reference_time=None, label="custom"):
+    #: none in the centers pickled before it
+    velocity = None
+
+    def __init__(self, offset=None, position=None, reference_time=None, label="custom",
+                 velocity=None):
         if (offset is None) == (position is None):
             raise ValueError("give exactly one of offset and position")
         self.offset = None if offset is None else np.asarray(offset, dtype=float)
         self.fixed_position = None if position is None else np.asarray(position, dtype=float)
         self.reference_time = None if reference_time is None else float(reference_time)
         self.label = label
+        if velocity is not None:
+            velocity = np.asarray(velocity, dtype=float)
+            if velocity.shape != (3,) or not np.linalg.norm(velocity) < 1e-3 * speed_of_light:
+                raise ValueError(f"velocity {velocity}: not 3 components well below c (m/s)")
+        self.velocity = velocity
 
     @classmethod
-    def geocenter(cls, reference_time=None):
+    def geocenter(cls, reference_time=None, velocity=None):
         """The geocentre (bilby's convention, the default)."""
-        return cls(offset=np.zeros(3), reference_time=reference_time, label="geocenter")
+        return cls(offset=np.zeros(3), reference_time=reference_time, label="geocenter",
+                   velocity=velocity)
 
     @classmethod
-    def interferometer(cls, interferometer, reference_time=None):
+    def interferometer(cls, interferometer, reference_time=None, velocity=None):
         """The vertex of ``interferometer``."""
         return cls(offset=interferometer.geometry.vertex, reference_time=reference_time,
-                   label=interferometer.name)
+                   label=interferometer.name, velocity=velocity)
 
     @classmethod
-    def weighted(cls, interferometers, weights, reference_time=None):
+    def weighted(cls, interferometers, weights, reference_time=None, velocity=None):
         """The ``weights``-weighted average of the vertices, e.g. with the
         optimal SNR squared of each detector as weights. ``weights`` is a
         sequence in the order of ``interferometers`` or a dict by name."""
@@ -292,13 +324,20 @@ class Center:
         weights = np.asarray(weights, dtype=float)
         vertices = np.array([ifo.geometry.vertex for ifo in interferometers])
         return cls(offset=weights @ vertices / weights.sum(), reference_time=reference_time,
-                   label="weighted average of " + ", ".join(ifo.name for ifo in interferometers))
+                   label="weighted average of " + ", ".join(ifo.name for ifo in interferometers),
+                   velocity=velocity)
 
     @classmethod
-    def fixed(cls, position):
+    def fixed(cls, position, velocity=None):
         """A fixed barycentric position (m, ICRS axes), as the center of
         the lgwa-response likelihood."""
-        return cls(position=position, label="fixed")
+        return cls(position=position, label="fixed", velocity=velocity)
+
+    def moving(self, velocity):
+        """This center, in the frame moving with ``velocity`` (m/s, ICRS
+        axes; ``None`` for the barycentre's)."""
+        return Center(offset=self.offset, position=self.fixed_position,
+                      reference_time=self.reference_time, label=self.label, velocity=velocity)
 
     def position(self, time, ephemeris=None):
         """Barycentric position (m) of the center for coalescence time
@@ -316,9 +355,11 @@ class Center:
 
     def __repr__(self):
         at = "coalescence" if self.reference_time is None else f"GPS {self.reference_time}"
+        moving = ("" if self.velocity is None
+                  else f", moving at {np.round(self.velocity, 3).tolist()} m/s")
         if self.fixed_position is not None:
-            return f"Center.fixed({self.fixed_position.tolist()})"
-        return f"Center({self.label}, at {at})"
+            return f"Center.fixed({self.fixed_position.tolist()}{moving})"
+        return f"Center({self.label}, at {at}{moving})"
 
 
 def resolve_center(center, interferometers=()):
@@ -354,7 +395,9 @@ def geocentre_delay(ra, dec, time, times_to_coalescence, center=None, orbital_mo
         ``time`` :math:`- \\tau`.
     center: Center, optional
         Defaults to the geocentre at coalescence, where this vanishes
-        without orbital motion.
+        without orbital motion. With a ``velocity``, the positions are
+        relative to the frame moving with it (which needs the orbital
+        motion).
     orbital_motion: bool
         Follow the geocentre along its orbit; otherwise hold it at its
         position at ``time``.
@@ -369,6 +412,8 @@ def geocentre_delay(ra, dec, time, times_to_coalescence, center=None, orbital_mo
     if ephemeris is None:
         ephemeris = default_ephemeris
     center = resolve_center(center)
+    if center.velocity is not None and not orbital_motion:
+        raise ValueError("a moving frame (Center.velocity) needs the orbital motion")
     times_to_coalescence = np.asarray(times_to_coalescence, dtype=float)
     direction = sky_direction(ra, dec)
     precession = precession_matrix(time)
@@ -386,6 +431,9 @@ def geocentre_delay(ra, dec, time, times_to_coalescence, center=None, orbital_mo
     else:
         distances = (ephemeris.projected_position(times, icrs_direction)
                      - direction @ center.position(time, ephemeris))
+    if center.velocity is not None:
+        # minus the frame's own displacement, V (t_f - t_c) = -V tau
+        distances = distances + (icrs_direction @ center.velocity) * times_to_coalescence.ravel()
     delay = -distances / speed_of_light
     if orbital_motion:
         return delay.reshape(times_to_coalescence.shape)
@@ -407,10 +455,100 @@ def detector_position(vertex, gps_times, axes_time=None, ephemeris=None):
     return geocentre + rotation @ np.asarray(vertex, dtype=float)
 
 
-def doppler_factor(ra, dec, time):
-    """:math:`1 - \\hat{n}\\cdot\\mathbf{v}_\\oplus(t)/c`: the ratio of the
-    detector-frame masses (and luminosity distance) inferred without the
-    orbital motion to those inferred with it (Solar-System-barycentre
-    frame), to first order in :math:`v/c`."""
+def doppler_factor(ra, dec, time, velocity=None):
+    """:math:`1 - \\hat{n}\\cdot\\mathbf{V}/c`: the ratio of the
+    detector-frame masses (and luminosity distance) of a frame moving with
+    ``velocity`` (m/s, ICRS axes; default the geocentre's at ``time``, the
+    frame of the masses inferred without the orbital motion) to those of the
+    Solar-System barycentre, to first order in :math:`v/c`. ``ra`` and
+    ``dec`` may be arrays."""
+    if velocity is None:
+        _, velocity = earth_barycentric_position_velocity(time)
+    return 1 - (precession_matrix(time) @ velocity) @ sky_direction(ra, dec) / speed_of_light
+
+
+def frame_doppler_factor(ra, dec, time, velocity):
+    """:math:`1 / (1 + \\hat{n}\\cdot\\mathbf{V}/c)`: the ratio of the
+    detector-frame masses (and luminosity distance) of a frame moving with
+    ``velocity`` (m/s, ICRS axes; :attr:`Center.velocity`) to those of the
+    Solar-System barycentre, as the response models it. The uniform part
+    :math:`-\\hat{n}\\cdot\\mathbf{V}\\tau/c` of the arrival-time delay
+    stretches the times to coalescence by :math:`1 + \\hat{n}\\cdot
+    \\mathbf{V}/c`; to first order this is :func:`doppler_factor`, and
+    closer to the response's own second order (by ~3 in the signal's phase
+    at 3 Hz). ``ra`` and ``dec`` may be arrays."""
+    return 1 / (1 + (precession_matrix(time) @ velocity) @ sky_direction(ra, dec)
+                / speed_of_light)
+
+
+def trajectory(gps_times, time, offset=None, ephemeris=None):
+    """Barycentric position (m, ICRS axes) at ``gps_times`` of the point
+    ``offset`` metres from the geocentre in Earth-fixed coordinates (default
+    the geocentre), with the Earth's orientation advancing from ``time`` as
+    in :func:`greenwich_mean_sidereal_times` and the precession of ``time``.
+    Shape ``np.shape(gps_times) + (3,)``."""
+    if ephemeris is None:
+        ephemeris = default_ephemeris
+    gps_times = np.asarray(gps_times, dtype=float)
+    positions = ephemeris.position(gps_times)
+    if offset is not None and np.any(offset):
+        rotation = sidereal_rotation(greenwich_mean_sidereal_times(gps_times, time))
+        positions = positions + (rotation @ np.asarray(offset, dtype=float)) @ precession_matrix(time)
+    return positions
+
+
+def point_velocity(time, offset=None):
+    """Barycentric velocity (m/s, ICRS axes) at ``time`` of the point
+    ``offset`` metres from the geocentre in Earth-fixed coordinates (default
+    the geocentre): the Earth's orbital velocity plus that of its rotation."""
     _, velocity = earth_barycentric_position_velocity(time)
-    return 1 - sky_direction(ra, dec) @ precession_matrix(time) @ velocity / speed_of_light
+    if offset is not None and np.any(offset):
+        step = 1.0
+        rotating = [(sidereal_rotation(greenwich_mean_sidereal_times(t, time))
+                     @ np.asarray(offset, dtype=float)) @ precession_matrix(time)
+                    for t in (time - step, time + step)]
+        velocity = velocity + (rotating[1] - rotating[0]) / (2 * step)
+    return velocity
+
+
+def fit_frame_velocity(time, frequencies, times_to_coalescence, weights, offset=None,
+                       ephemeris=None):
+    """The constant velocity (m/s, ICRS axes) that best approximates the
+    motion of a point over a signal, for :attr:`Center.velocity`.
+
+    A uniform motion delays frequency :math:`f` by :math:`-\\hat{n}\\cdot
+    \\mathbf{V}\\tau(f)/c`, which to first order is a rescaling of the masses
+    (:math:`\\partial\\Psi/\\partial\\ln\\mathcal{M} = -2\\pi f\\tau`). The
+    displacement :math:`\\mathbf{r}(t_c - \\tau) - \\mathbf{r}(t_c)` of the point
+    (``offset`` metres from the geocentre in Earth-fixed coordinates: the
+    geocentre by default, or e.g. the SNR-weighted average of a network's
+    vertices) is fitted, by least squares with ``weights`` (the phase-error
+    weight of a delay, :math:`(2\\pi f)^2 |\\tilde h|^2/S_n\\,\\Delta f` per
+    frequency), with :math:`\\mathbf{a} + \\mathbf{b}/f - \\mathbf{V}\\tau`: the
+    parts of a delay absorbed by the time and the phase are left out of
+    :math:`\\mathbf{V}`. The residual motion is then orthogonal to the
+    rescaling of the masses, whatever the sky position, so their posterior
+    in the frame of :math:`\\mathbf{V}` is the same in every sky mode.
+
+    Parameters
+    ==========
+    time: float
+        Coalescence time (GPS s).
+    frequencies, times_to_coalescence, weights: array_like
+        The signal's time to coalescence :math:`\\tau` and the weights at
+        each frequency.
+    offset: array_like, optional
+    ephemeris: EarthEphemeris, optional
+    """
+    frequencies = np.asarray(frequencies, dtype=float)
+    tau = np.asarray(times_to_coalescence, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    keep = (weights > 0) & np.isfinite(tau)
+    frequencies, tau, weights = frequencies[keep], tau[keep], weights[keep]
+    displacement = (trajectory(time - tau, time, offset, ephemeris)
+                    - trajectory(np.array([time]), time, offset, ephemeris)[0])
+    basis = np.stack([np.ones_like(tau), 1 / frequencies, -tau], axis=1)
+    scale = np.sqrt(np.sum(weights[:, None] * basis ** 2, axis=0))
+    root = np.sqrt(weights)[:, None]
+    coefficients = np.linalg.lstsq(root * basis / scale, root * displacement, rcond=None)[0]
+    return coefficients[2] / scale[2]

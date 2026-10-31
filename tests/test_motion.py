@@ -11,11 +11,15 @@ from bilby_xG.motion import (
     detector_position,
     doppler_factor,
     earth_barycentric_position_velocity,
+    fit_frame_velocity,
+    frame_doppler_factor,
     geocentre_delay,
     hermite_interpolate,
+    point_velocity,
     precession_matrix,
     resolve_center,
     sky_direction,
+    trajectory,
 )
 from bilby_xG.utils import calculate_time_to_merger_for_any_mode
 
@@ -184,12 +188,18 @@ def test_jax_geocentre_delay(orbital_motion):
     ifo = InterferometerList(["CE"])[0]
     ttc = np.geomspace(1e-3, 5e4, 100)
     table = dict(default_ephemeris.table(TC - 86400, TC + 86400), precession=precession_matrix(TC))
+    _, velocity = earth_barycentric_position_velocity(TC - 3600)
     for center in [Center.geocenter(), Center.interferometer(ifo),
-                   Center.fixed([1e11, 2e10, -3e10])]:
+                   Center.fixed([1e11, 2e10, -3e10]),
+                   Center.geocenter(velocity=velocity), Center.interferometer(ifo, velocity=velocity)]:
+        if center.velocity is not None and not orbital_motion:
+            continue
         if center.offset is not None:
             jax_center = dict(offset=center.offset)
         else:
             jax_center = dict(position=center.position(TC))
+        if center.velocity is not None:
+            jax_center["velocity"] = center.velocity
         delay = _geocentre_delay(jnp.float64(RA), jnp.float64(DEC), jnp.float64(TC),
                                  jnp.float64(_gmst(TC)), jnp.asarray(ttc), table, jax_center,
                                  orbital_motion)
@@ -303,3 +313,125 @@ def test_uniform_part_is_a_doppler_rescaling_with_the_waveform_time():
 
     assert residual(True) < 1e-4
     assert residual(False) > 3e-4
+
+
+def test_moving_frame_delay():
+    """In the frame of a velocity V the geocentre's delay loses V's uniform
+    part: with V the Earth's velocity at coalescence, only the curvature of
+    the orbit is left."""
+    ttc = np.geomspace(1e-3, 1e5, 200)
+    _, velocity = earth_barycentric_position_velocity(TC)
+    frame = Center.geocenter(velocity=velocity)
+    delay = geocentre_delay(RA, DEC, TC, ttc, center=frame)
+    projected = (precession_matrix(TC) @ velocity) @ sky_direction(RA, DEC)
+    np.testing.assert_allclose(
+        delay, geocentre_delay(RA, DEC, TC, ttc) - projected * ttc / speed_of_light,
+        rtol=0, atol=1e-12)
+    # to 1e-5 of the uniform part over 100 s (the ephemeris' velocity and its
+    # interpolated positions agree to ~cm/s), as test_geocentre_delay
+    assert np.abs(delay[ttc < 100]).max() < 1e-5 * abs(projected) * 100 / speed_of_light
+    assert 1e-3 < np.abs(delay[-1]) < 0.1
+    np.testing.assert_allclose(doppler_factor(RA, DEC, TC, velocity), doppler_factor(RA, DEC, TC))
+    with pytest.raises(ValueError, match="orbital motion"):
+        geocentre_delay(RA, DEC, TC, ttc, center=frame, orbital_motion=False)
+    # an array of sky positions
+    ras, decs = np.array([RA, 0.1]), np.array([DEC, 0.9])
+    np.testing.assert_allclose(doppler_factor(ras, decs, TC, velocity)[1],
+                               doppler_factor(0.1, 0.9, TC, velocity))
+    assert "moving at" in repr(frame) and frame.moving(None).velocity is None
+
+
+@pytest.mark.parametrize("hours", [0.0, 3.0])
+def test_moving_frame_is_doppler_rescaling(hours):
+    """In the frame of any constant velocity V the signal is the barycentric
+    one with masses and distance multiplied by frame_doppler_factor(V), down
+    to low frequencies (the curvature of the orbit is the same in both), to
+    the response's second order in v/c (closer than with the first-order
+    doppler_factor). Not rescaling them leaves the full Doppler phase."""
+    pytest.importorskip("mlgw_bns")
+    from bilby_xG.source import convert_to_mlgw_bns_parameters, mlgw_bns_individual_modes
+
+    ifo = InterferometerList(["ET_1L_IT"])[0]
+    frequencies = np.geomspace(5.0, 1000.0, 20_000)
+    ra, dec, tc = 1.0, 0.5, TC + 1e7
+    velocity = point_velocity(tc - 3600 * hours, ifo.geometry.vertex)
+    frame = Center.geocenter(velocity=velocity)
+    factor = frame_doppler_factor(ra, dec, tc, velocity)
+
+    def strain(scale, center):
+        parameters, _ = convert_to_mlgw_bns_parameters(dict(
+            chirp_mass=1.2 * scale, mass_ratio=0.9, chi_1=0.0, chi_2=0.0, lambda_1=400.0,
+            lambda_2=600.0, luminosity_distance=40.0 * scale, theta_jn=0.5, phase=0.3,
+            ra=ra, dec=dec, psi=0.3, geocent_time=tc))
+        pols = mlgw_bns_individual_modes(frequencies, **parameters, mode_array=[[2, 2]])
+        return ifo.get_detector_response_for_frequency_dependent_antenna_response(
+            pols, parameters, tc - 1e4, frequencies, center=center)
+
+    signal = strain(1.0, None)
+    residual = np.abs(np.log(strain(factor, frame) / signal))
+    assert residual.max() < 3e-4
+    assert residual[frequencies > 30].max() < 3e-5
+    first_order = doppler_factor(ra, dec, tc, velocity)
+    assert np.abs(np.log(strain(first_order, frame) / signal)).max() > 2 * residual.max()
+    assert np.abs(np.log(strain(1.0, frame) / signal)).max() > 1
+
+
+def test_trajectory_and_point_velocity():
+    vertex = InterferometerList(["ET_1L_IT"])[0].geometry.vertex
+    times = TC + np.array([-1.0, 0.0, 1.0])
+    np.testing.assert_allclose(trajectory(times, TC), default_ephemeris.position(times))
+    positions = trajectory(times, TC, vertex)
+    np.testing.assert_allclose(np.linalg.norm(positions - trajectory(times, TC), axis=1),
+                               np.linalg.norm(vertex), rtol=1e-12)
+    # the Earth-fixed vertex at its barycentric position (detector_position, ICRS axes)
+    np.testing.assert_allclose(positions @ precession_matrix(TC).T,
+                               detector_position(vertex, times, axes_time=TC), rtol=0, atol=1e-3)
+    np.testing.assert_allclose(point_velocity(TC, vertex), (positions[2] - positions[0]) / 2,
+                               rtol=0, atol=1e-3)
+    rotation = point_velocity(TC, vertex) - point_velocity(TC)
+    assert 250 < np.linalg.norm(rotation) < 400  # 465 m/s cos(latitude)
+
+
+def test_fit_frame_velocity():
+    """The fitted velocity is that of the point at an epoch within the
+    signal, where the weights are: the merger's for weights at the merger,
+    earlier for weights spread over hours."""
+    vertex = InterferometerList(["ET_1L_IT"])[0].geometry.vertex
+    frequencies = np.geomspace(3.0, 1000.0, 5000)
+    tau = calculate_time_to_merger_for_any_mode(frequencies, 1.45, 1.3, mode=2, safety=1)
+    # the rotation accelerates the vertex by ~0.03 m/s^2: weights over ~10 s
+    late = np.exp(-tau / 10.0)
+    v_late = fit_frame_velocity(TC, frequencies, tau, late, vertex)
+    assert np.linalg.norm(v_late - point_velocity(TC, vertex)) < 1.0
+    spread = frequencies ** (-7 / 3) * frequencies ** 2 * np.gradient(frequencies)
+    for offset in (None, vertex):
+        v_fit = fit_frame_velocity(TC, frequencies, tau, spread, offset)
+        epochs = np.linspace(0, tau.max(), 2001)
+        distance = [np.linalg.norm(v_fit - point_velocity(TC - e, offset)) for e in epochs]
+        best = epochs[np.argmin(distance)]
+        assert 600 < best < 0.8 * tau.max()
+        assert min(distance) < 0.2 * np.linalg.norm(v_fit - point_velocity(TC, offset))
+    with pytest.raises(ValueError, match="well below c"):
+        Center.geocenter(velocity=[3e8, 0, 0])
+
+
+def test_frame_parameter_conversion():
+    from bilby_xG.conversion import (barycentre_to_frame_parameters,
+                                     frame_to_barycentre_parameters)
+
+    _, velocity = earth_barycentric_position_velocity(TC)
+    rng = np.random.default_rng(3)
+    samples = dict(ra=rng.uniform(0, 2 * np.pi, 50), dec=rng.uniform(-1, 1, 50),
+                   chirp_mass=np.full(50, 1.2), luminosity_distance=np.full(50, 100.0),
+                   mass_ratio=np.full(50, 0.8), geocent_time=np.full(50, TC))
+    frame = barycentre_to_frame_parameters(samples, velocity)
+    factor = frame_doppler_factor(samples["ra"], samples["dec"], TC, velocity)
+    np.testing.assert_allclose(factor, doppler_factor(samples["ra"], samples["dec"], TC, velocity),
+                               rtol=1e-8)
+    np.testing.assert_allclose(frame["chirp_mass"], 1.2 * factor)
+    np.testing.assert_allclose(frame["luminosity_distance"], 100.0 * factor)
+    np.testing.assert_array_equal(frame["mass_ratio"], samples["mass_ratio"])
+    back = frame_to_barycentre_parameters(frame, velocity)
+    np.testing.assert_allclose(back["chirp_mass"], samples["chirp_mass"], rtol=1e-14)
+    # 2 |v| / c over the sky
+    assert 1.5e-4 < np.ptp(frame["chirp_mass"]) / 1.2 < 2e-4

@@ -184,7 +184,8 @@ def _geocentre_delay(ra, dec, geocent_time, gmst, times_to_coalescence, orbit, c
     """:func:`bilby_xG.motion.geocentre_delay` in JAX, on the node table
     ``orbit`` (see :meth:`bilby_xG.motion.EarthEphemeris.table`, with its
     ``precession`` matrix). ``center`` is a dict with either ``offset``
-    (Earth-fixed, at coalescence) or ``position`` (fixed, axes of date)."""
+    (Earth-fixed, at coalescence) or ``position`` (fixed, axes of date), and
+    the ``velocity`` (ICRS axes) of a moving frame if any."""
     import jax.numpy as jnp
 
     direction = jnp.stack([jnp.cos(dec) * jnp.cos(ra), jnp.cos(dec) * jnp.sin(ra), jnp.sin(dec)])
@@ -199,7 +200,11 @@ def _geocentre_delay(ra, dec, geocent_time, gmst, times_to_coalescence, orbit, c
         center_distance = distances[-1] + earth_fixed @ center["offset"]
     else:
         center_distance = direction @ center["position"]
-    delay = -(distances[:-1] - center_distance) / speed_of_light
+    distances = distances[:-1] - center_distance
+    if "velocity" in center:
+        # minus the frame's own displacement, V (t_f - t_c) = -V tau
+        distances = distances + (icrs_direction @ center["velocity"]) * times_to_coalescence
+    delay = -distances / speed_of_light
     return delay if orbital_motion else jnp.full_like(times_to_coalescence, delay[0])
 
 
@@ -313,6 +318,10 @@ class BatchedRelativeBinningLikelihood(Likelihood):
             self._arrays["center"] = dict(offset=center.offset)
         else:
             self._arrays["center"] = dict(position=center.position(self.start_time))
+        if center.velocity is not None:
+            if not self._orbital_motion:
+                raise ValueError("a moving frame (Center.velocity) needs the orbital motion")
+            self._arrays["center"]["velocity"] = center.velocity
         self.split = getattr(likelihood, "precessing_scheme", "ratio") == "split"
         if self.precessing:
             self._modes = mlgw_bns_precessing_jax_modes(

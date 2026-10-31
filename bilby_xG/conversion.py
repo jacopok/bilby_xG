@@ -93,3 +93,49 @@ def convert_to_lal_binary_neutron_star_parameters(parameters):
     """As bilby's BNS converter, but also accepts ``log10_luminosity_distance``,
     and gives ``chi_i`` for precessing spins."""
     return _add_aligned_spin_components(*_convert_bns(_add_log10_luminosity_distance(parameters)))
+
+
+#: the parameters a uniform motion of the observer rescales (to first order
+#: in v/c, by the Doppler factor), wherever they are given
+FRAME_SCALED_PARAMETERS = ("chirp_mass", "total_mass", "mass_1", "mass_2",
+                           "luminosity_distance")
+
+
+def _frame_factor(parameters, velocity, time=None):
+    from .motion import frame_doppler_factor
+
+    if time is None:
+        # the Earth's axes and the frame's Doppler factor vary negligibly
+        # over a posterior's times: one time for all the samples
+        time = float(np.mean(geocent_time(parameters)))
+    return frame_doppler_factor(np.asarray(parameters["ra"]), np.asarray(parameters["dec"]),
+                                time, velocity)
+
+
+def barycentre_to_frame_parameters(parameters, velocity, time=None):
+    """``parameters`` with the detector-frame masses and luminosity distance
+    (those of :data:`FRAME_SCALED_PARAMETERS` present) of the Solar-System
+    barycentre replaced by those of a frame moving with ``velocity`` (m/s,
+    ICRS axes; :attr:`bilby_xG.motion.Center.velocity`): multiplied by
+    :func:`bilby_xG.motion.frame_doppler_factor` at the sky position.
+    ``time`` (GPS s) defaults to the samples' mean coalescence
+    time. Parameters given at a reference frequency (a precessing
+    waveform's phase) are left as they are: they depend on the waveform
+    model. A dict, or anything indexed like one (a pandas DataFrame), is
+    copied."""
+    factor = _frame_factor(parameters, velocity, time)
+    out = parameters.copy()
+    for key in FRAME_SCALED_PARAMETERS:
+        if key in out:
+            out[key] = out[key] * factor
+    return out
+
+
+def frame_to_barycentre_parameters(parameters, velocity, time=None):
+    """The inverse of :func:`barycentre_to_frame_parameters`."""
+    factor = _frame_factor(parameters, velocity, time)
+    out = parameters.copy()
+    for key in FRAME_SCALED_PARAMETERS:
+        if key in out:
+            out[key] = out[key] / factor
+    return out
