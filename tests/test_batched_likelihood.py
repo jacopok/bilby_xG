@@ -279,3 +279,9 @@ def test_batched_model_constraint_with_fixed_parameters():
     assert np.isfinite(got[0]) and got[1] == -np.inf
     np.testing.assert_allclose(model.log_likelihood(x[0]), -1.7 - 0.5)
     assert model.log_likelihood(x[1]) == -np.inf
+    # the prior: -inf outside the constraint, without bilby's log(0) warning
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        lp = model.log_prior(x)
+    assert np.all(np.isfinite(lp[total <= 4])) and np.all(lp[total > 4] == -np.inf)

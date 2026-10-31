@@ -591,7 +591,10 @@ def _batched_bilby_model_classes():
 
         def log_prior(self, x):
             theta = {n: x[n] for n in self.names}
-            return self.bilby_priors.ln_prob(theta, axis=0)
+            # bilby's check_ln_prob takes the log of the constraints' mask
+            # on purpose: -inf outside them, with a divide-by-zero warning
+            with np.errstate(divide="ignore"):
+                return self.bilby_priors.ln_prob(theta, axis=0)
 
     return BatchedBilbyModel, BatchedBilbyModelLikelihoodConstraint
 
