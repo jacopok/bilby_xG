@@ -2,7 +2,7 @@
 # 
 # 
 name = 'ET-EMR'
-power_spectral_density = PowerSpectralDensity(psd_file='ET_10_HFLF_psd.txt')
+power_spectral_density = PowerSpectralDensity(psd_file='ET2026a_10_HFLF_psd.txt')
 length = 10
 minimum_frequency = 3
 maximum_frequency = 4096

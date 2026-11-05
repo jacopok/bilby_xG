@@ -33,12 +33,22 @@ def detector_file(name):
     return str(path) if path.is_file() else None
 
 
+#: the ET PSDs' names before they were labelled by their release (ET2026a);
+#: ET_15_HFLF_psd.txt was the 15 km HFLF curve before the release's last
+#: revision (et-sensitivity-curves 66177cc, the signal-recycling cavity's
+#: length: up to 1% above 1.7 kHz), and resolves to the revised one
+LEGACY_NOISE_CURVES = {
+    f"ET_{length}_{name}.txt": f"ET2026a_{length}_{name}.txt"
+    for length in (10, 15) for name in ("HFLF_psd", "HF_psd_pub", "HF_psd_pub_nofsr")}
+
+
 def noise_curve_file(filename):
     """Return the path to a shipped noise-curve file, else ``None``.
 
-    ``filename`` may be a bare name (e.g. ``"ce20_asd.txt"``).
+    ``filename`` may be a bare name (e.g. ``"ce20_asd.txt"``), or one of the
+    :data:`LEGACY_NOISE_CURVES` names.
     """
-    path = NOISE_CURVES_DIR / filename
+    path = NOISE_CURVES_DIR / LEGACY_NOISE_CURVES.get(filename, filename)
     return str(path) if path.is_file() else None
 
 

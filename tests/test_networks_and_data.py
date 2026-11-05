@@ -95,11 +95,20 @@ def test_einstein_telescope_l_shaped_detectors_resolve_by_name():
 
 def test_einstein_telescope_hflf_psd_resolves_by_bare_name():
     for length in (10, 15):
-        psd = PowerSpectralDensity(psd_file=f"ET_{length}_HFLF_psd.txt")
+        psd = PowerSpectralDensity(psd_file=f"ET2026a_{length}_HFLF_psd.txt")
         assert psd.psd_array is not None
         assert np.all(np.isfinite(psd.psd_array[psd.psd_array > 0]))
         # HFLF curve extends below the high-frequency f_min.
         assert psd.frequency_array.min() <= 2
+
+
+def test_einstein_telescope_legacy_psd_names_resolve_to_et2026a():
+    for length in (10, 15):
+        for name in ("HFLF_psd", "HF_psd_pub", "HF_psd_pub_nofsr"):
+            legacy = PowerSpectralDensity(psd_file=f"ET_{length}_{name}.txt")
+            current = PowerSpectralDensity(psd_file=f"ET2026a_{length}_{name}.txt")
+            assert legacy.psd_file == current.psd_file
+            np.testing.assert_array_equal(legacy.psd_array, current.psd_array)
 
 
 def test_einstein_telescope_triangle_resolves_by_name():
@@ -121,7 +130,7 @@ def test_triangle_arms_lie_along_the_edges(latitude, longitude, xarm_azimuth):
     # an equilateral triangle of straight 10 km arms, in which each channel's
     # x arm ends at the next vertex and its y arm at the previous one
     et = TriangularInterferometer(
-        "T", PowerSpectralDensity(psd_file="ET_10_HFLF_psd.txt"), 3, 4096, 10,
+        "T", PowerSpectralDensity(psd_file="ET2026a_10_HFLF_psd.txt"), 3, 4096, 10,
         latitude, longitude, 100.0, xarm_azimuth, xarm_azimuth + 60)
     vertices = [ifo.vertex for ifo in et]
     for i, ifo in enumerate(et):

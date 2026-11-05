@@ -169,19 +169,27 @@ ephemeris in `benchmarks/orbital_motion_validation.py`.
 (`CE`, `CE20`) and the latest Einstein Telescope configurations: the 10 km
 triangle at the Euregio Meuse–Rhine site (`ET-EMR`) and the 15 km L-shaped
 detectors in Sardinia (`ET_1L_IT`) and Lusatia (`ET_1L_DE`) — together with
-their amplitude/power spectral densities (`CE`/`CE20` ASDs; the ET
-cryogenic high-and-low-frequency PSDs `ET_10_HFLF_psd.txt` /
-`ET_15_HFLF_psd.txt` and the published high-frequency-only PSDs
-`ET_10_HF_psd_pub.txt` / `ET_15_HF_psd_pub.txt`), resolved automatically by
-`bilby_xG.networks`.
+their amplitude/power spectral densities (`CE`/`CE20` ASDs; for ET the
+ET2026a release, https://gitlab.et-gw.eu/pub/et-sensitivity-curves at
+66177cc: the cryogenic high-and-low-frequency PSDs `ET2026a_10_HFLF_psd.txt` /
+`ET2026a_15_HFLF_psd.txt` and the published high-frequency-only PSDs
+`ET2026a_10_HF_psd_pub.txt` / `ET2026a_15_HF_psd_pub.txt`), resolved
+automatically by `bilby_xG.networks`. `scripts/make_et2026a_psds.py` writes
+them from a checkout of that repository.
 
 The published HF PSDs are the default pyGWINC sensitivity of the ET
-sensitivity curves (https://gitlab.et-gw.eu/pub/et-sensitivity-curves, the
-January 2026 snapshot), which includes a high-frequency correction: the
+sensitivity curves, which includes a high-frequency correction: the
 finite-size response for a signal 15 degrees off zenith. With the
 finite-size response (`finite_size=True`) that suppression is counted twice.
-`ET_10_HF_psd_pub_nofsr.txt` / `ET_15_HF_psd_pub_nofsr.txt` are the same
-curves without it, the displacement ASD over the arm length squared.
+`ET2026a_10_HF_psd_pub_nofsr.txt` / `ET2026a_15_HF_psd_pub_nofsr.txt` are the
+same curves without it, the displacement ASD over the arm length squared, as
+are the HF and LF curves the HFLF PSDs combine (1 / (1 / S_HF + 1 / S_LF)).
+
+The earlier names, `ET_<L>_*.txt`, still resolve, to the ET2026a files
+(`bilby_xG.utils.LEGACY_NOISE_CURVES`). The curves are the same but for
+`ET_15_HFLF_psd.txt`, which predated the release's last revision (the
+signal-recycling cavity's length) and differs from it by up to 1% above
+1.7 kHz.
 
 By default, the `ET-EMR`, `ET_1L_IT` and `ET_1L_DE` definitions use the **HFLF**
 sensitivity with `minimum_frequency = 3` Hz. 
@@ -196,7 +204,7 @@ from bilby_xG.networks import InterferometerList, PowerSpectralDensity
 ifos = InterferometerList(["ET_1L_IT", "ET_1L_DE"])
 for ifo in ifos:
     ifo.power_spectral_density = PowerSpectralDensity(
-        psd_file=f"ET_{int(ifo.length)}_HF_psd_pub.txt")
+        psd_file=f"ET2026a_{int(ifo.length)}_HF_psd_pub.txt")
     ifo.minimum_frequency = 6
 ```
 
