@@ -209,6 +209,56 @@ def test_teobresums_spa_modes():
     assert slope == pytest.approx(-7 / 6, abs=0.05)
 
 
+def test_teobresums_spa_body_1_is_the_heavier_one():
+    """bilby labels the heavier body 1. TEOBResumS takes q = M_A / M_B and, for q < 1,
+    gives chi1z/LambdaAl2 to the lighter body; so mass_ratio and 1 / mass_ratio must give
+    the same waveform, and the (2,2) mode with unequal spins and tides must follow
+    IMRPhenomXAS_NRTidalv3 (white-noise mismatch, maximised over time and phase)."""
+    pytest.importorskip("EOBRun_module")
+    lal = pytest.importorskip("lal")
+    lalsim = pytest.importorskip("lalsimulation")
+    from bilby_xG.source import (
+        convert_to_teobresums_parameters,
+        teobresums_spa_individual_modes,
+    )
+
+    parameters = dict(PARAMETERS, mass_ratio=0.6, chi_1=0.02, chi_2=-0.01, lambda_1=100.0,
+                      lambda_2=3000.0, luminosity_distance=100.0, theta_jn=0.4, phase=0.3)
+    params, _ = convert_to_teobresums_parameters(dict(parameters))
+    kwargs = {key: params[key] for key in SOURCE_KEYS}
+    freqs = np.geomspace(20.0, 1024.0, 20000)
+
+    def teob(**overrides):
+        return teobresums_spa_individual_modes(
+            freqs, **dict(kwargs, **overrides), reference_frequency=20.0,
+            minimum_frequency=20.0, mode_array=[[2, 2], [3, 3]], frequency_bin_edges=freqs)
+
+    direct, inverse = teob(), teob(q=1.0 / kwargs["q"])
+    for key in direct:
+        np.testing.assert_array_equal(direct[key]["plus"], inverse[key]["plus"])
+
+    tides = lal.CreateDict()
+    lalsim.SimInspiralWaveformParamsInsertTidalLambda1(tides, parameters["lambda_1"])
+    lalsim.SimInspiralWaveformParamsInsertTidalLambda2(tides, parameters["lambda_2"])
+    sequence = lal.CreateREAL8Vector(len(freqs))
+    sequence.data = freqs
+    reference, _ = lalsim.SimInspiralChooseFDWaveformSequence(
+        parameters["phase"], params["mass_1"] * lal.MSUN_SI, params["mass_2"] * lal.MSUN_SI,
+        0.0, 0.0, parameters["chi_1"], 0.0, 0.0, parameters["chi_2"], 20.0,
+        parameters["luminosity_distance"] * 1e6 * lal.PC_SI, parameters["theta_jn"], tides,
+        lalsim.GetApproximantFromString("IMRPhenomXAS_NRTidalv3"), sequence)
+    h_ref, h = reference.data.data, direct["2,2"]["plus"]
+    weights = np.gradient(freqs)
+    phase = np.unwrap(np.angle(h * np.conj(h_ref)))
+    t_fit = -np.polyfit(freqs, phase, 1, w=np.abs(h))[0] / (2 * np.pi)
+    norm = np.sqrt(np.sum(weights * np.abs(h) ** 2) * np.sum(weights * np.abs(h_ref) ** 2))
+    overlap = max(
+        np.abs(np.sum(weights * h * np.conj(h_ref) * np.exp(2j * np.pi * freqs * shift))) / norm
+        for shift in t_fit + np.linspace(-3e-3, 3e-3, 601))
+    # body labels swapped: mismatch 0.11; right labels: 1.4e-4
+    assert 1 - overlap < 2e-3
+
+
 def test_mlgw_bns_time_to_merger():
     """Each mode carries -t(f) = phi'(f) / 2 pi, close to the 2PN estimate
     early in the inspiral."""

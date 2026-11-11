@@ -2228,6 +2228,9 @@ def teobresums_spa_individual_modes(frequency_array, M, q, chi1z, chi2z,
     """
     import EOBRun_module
 
+    # TEOBResumS takes q = M_A / M_B >= 1 and, for q < 1, swaps the bodies with their
+    # spins and tides (TEOBResumSPars.c); bilby's body 1 (chi1z, LambdaAl2) is the heavier
+    q = max(q, 1.0 / q)
     freqs = kwargs.get("frequency_bin_edges", frequency_array)
     freqs = np.asarray(freqs).tolist()
     waveform_kwargs = dict(
