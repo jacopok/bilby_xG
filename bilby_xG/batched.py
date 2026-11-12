@@ -323,6 +323,20 @@ class BatchedRelativeBinningLikelihood(Likelihood):
                 raise ValueError("a moving frame (Center.velocity) needs the orbital motion")
             self._arrays["center"]["velocity"] = center.velocity
         self.split = getattr(likelihood, "precessing_scheme", "ratio") == "split"
+        # calibration (bilby_xG.calibration): the splines at the bin edges, as
+        # weights (ifo, edge, node); a detector without a model has zero
+        # weights and nodes (C = 1)
+        from .calibration import calibration_at
+        calibration = calibration_at(ifos, self.frequencies)
+        self._calibration = [calibration[ifo.name] for ifo in ifos]
+        if any(c is not None for c in self._calibration):
+            n_nodes = max(c.n_points for c in self._calibration if c is not None)
+            weights = np.zeros((len(ifos), len(self.frequencies), n_nodes))
+            for i, c in enumerate(self._calibration):
+                if c is not None:
+                    weights[i, :, :c.n_points] = c.weights
+            self._arrays["calibration_weights"] = weights
+            self._calibration_nodes = n_nodes
         if self.precessing:
             self._modes = mlgw_bns_precessing_jax_modes(
                 self.mode_array, self.frequencies, wfg.waveform_arguments, twist=self.split)
@@ -405,12 +419,24 @@ class BatchedRelativeBinningLikelihood(Likelihood):
                     fps, fcs = response
                     strains.append(plus[k] * fps + cross[k] * fcs)
             ratios.append(jnp.stack(strains))
+        calibration = None
+        if "calibration_weights" in arrays:
+            from .calibration import calibration_factor
+            weights = arrays["calibration_weights"]  # (ifo, edge, node)
+            calibration = calibration_factor(
+                jnp.einsum("ien,in->ie", weights, p["calibration_amplitude"]),
+                jnp.einsum("ien,in->ie", weights, p["calibration_phase"]))  # (ifo, edge)
         if self.split:
             factors = jnp.stack(ratios)  # (ifo, mode, fast/slow, edge)
+            slow = factors[:, :, 1]
+            if calibration is not None:
+                slow = slow * calibration[:, None, :]
             r0, r1 = split_scheme_coefficients(
-                factors[:, :, 0] / arrays["reference"], factors[:, :, 1], arrays["bin_widths"])
+                factors[:, :, 0] / arrays["reference"], slow, arrays["bin_widths"])
         else:
             ratio = jnp.stack(ratios) / arrays["reference"]  # (ifo, mode, edge)
+            if calibration is not None:
+                ratio = ratio * calibration[:, None, :]
             r0 = 0.5 * (ratio[..., 1:] + ratio[..., :-1])
             r1 = (ratio[..., 1:] - ratio[..., :-1]) / arrays["bin_widths"]
         d_inner_h = jnp.sum(arrays["a0"] * jnp.conj(r0) + arrays["a1"] * jnp.conj(r1),
@@ -456,8 +482,19 @@ class BatchedRelativeBinningLikelihood(Likelihood):
             inputs.update(chi_1=converted["chi1z"], chi_2=converted["chi2z"],
                           inclination=converted["inclination"],
                           phase=converted["coalescence_angle"])
-        return {key: np.broadcast_to(np.asarray(value, dtype=float), (size,))
-                for key, value in inputs.items()}, size
+        inputs = {key: np.broadcast_to(np.asarray(value, dtype=float), (size,))
+                  for key, value in inputs.items()}
+        if "calibration_weights" in self._arrays:
+            # (size, ifo, node); zeros (C = 1) where the parameters have none
+            shape = (size, len(self._calibration), self._calibration_nodes)
+            amplitude, phase = np.zeros(shape), np.zeros(shape)
+            for i, c in enumerate(self._calibration):
+                nodes = None if c is None else c.nodes(parameters)
+                if nodes is not None:
+                    amplitude[:, i, :c.n_points] = np.broadcast_to(nodes[0].T, (size, c.n_points))
+                    phase[:, i, :c.n_points] = np.broadcast_to(nodes[1].T, (size, c.n_points))
+            inputs.update(calibration_amplitude=amplitude, calibration_phase=phase)
+        return inputs, size
 
     def log_likelihood_ratio(self, parameters=None):
         """ln L ratio at ``parameters``, a dict of scalars (returns a float)
@@ -470,7 +507,9 @@ class BatchedRelativeBinningLikelihood(Likelihood):
         chunk = 1 if size == 1 else self.batch_size
         for start in range(0, size, chunk):
             stop = min(start + chunk, size)
-            batch = {key: np.pad(value[start:stop], (0, chunk - (stop - start)), mode="edge")
+            batch = {key: np.pad(value[start:stop],
+                                 [(0, chunk - (stop - start))] + [(0, 0)] * (value.ndim - 1),
+                                 mode="edge")
                      for key, value in inputs.items()}
             out[start:stop] = np.asarray(self._batched(batch, self._arrays))[:stop - start]
         return float(out[0]) if scalar else out
