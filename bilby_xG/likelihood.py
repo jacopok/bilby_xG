@@ -833,7 +833,12 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
 
     Notes
     -----
-    The relative binning likelihood does not currently support calibration marginalization.
+    Calibration uncertainty: an interferometer with bilby's ``CubicSpline``
+    calibration model (``interferometer.calibration_model``) has its response
+    multiplied by the spline's factor at the bin edges, with the node values
+    as sampled parameters (:mod:`bilby_xG.calibration`); parameters without
+    them are at the nominal calibration. Calibration marginalization is not
+    supported.
     """
 
     # Fallbacks for instances pickled before the detector motion was added:
@@ -1679,11 +1684,24 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         state = self.__dict__.copy()
         state.pop("_shared_response_cache", None)
         state.pop("_legacy_fiducial", None)
+        state.pop("_calibration_cache", None)
         return state
 
     def __setstate__(self, state):
         state.pop("_shared_response_cache", None)
         self.__dict__.update(state)
+
+    def _calibration_factor(self, interferometer, parameters):
+        """The interferometer's calibration factor at the bin edges for
+        ``parameters`` (:mod:`bilby_xG.calibration`), or None (no calibration
+        model, or the nominal calibration)."""
+        from .calibration import calibration_at
+        cache = self.__dict__.get("_calibration_cache")
+        if cache is None or cache[0] is not self.bin_freqs:
+            cache = (self.bin_freqs, calibration_at(self.interferometers, self.bin_freqs))
+            self._calibration_cache = cache
+        calibration = cache[1].get(interferometer.name)
+        return None if calibration is None else calibration.factor(parameters)
 
     def compute_waveform_ratio_per_interferometer(self, waveform_polarizations, interferometer, parameters=None):
         name = interferometer.name
@@ -1691,9 +1709,11 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         parameters = _resolve_parameters(self, parameters)
         converted_parameters, _ = self.waveform_generator.parameter_conversion(parameters)
         shared = self._shared_response(converted_parameters)
+        calibration = self._calibration_factor(interferometer, parameters)
         if self.precessing_scheme == "split":
             return self._split_ratio_per_interferometer(
-                waveform_polarizations, interferometer, converted_parameters, shared)
+                waveform_polarizations, interferometer, converted_parameters, shared,
+                calibration)
 
         for ell, emm in self.mode_array:
             mode_key = f"{ell},{emm}"
@@ -1711,17 +1731,20 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                 shared=shared)
             reference_strain = self.per_detector_per_mode_fiducial_waveform_points[name][mode_key]
             waveform_ratio = strain / reference_strain
+            if calibration is not None:
+                waveform_ratio = waveform_ratio * calibration
             r0[mode_key] = 0.5 * (waveform_ratio[1:] + waveform_ratio[:-1])
             r1[mode_key] = (waveform_ratio[1:] - waveform_ratio[:-1]) / self.bin_widths
 
         return r0, r1
 
     def _split_ratio_per_interferometer(self, waveform_polarizations, interferometer,
-                                        converted_parameters, shared):
+                                        converted_parameters, shared, calibration=None):
         """``compute_waveform_ratio_per_interferometer`` for
         ``precessing_scheme="split"``: in each bin, the linearised ratio
         ``r = fast / fast_0`` times the linearised ``slow``, to first order
-        in the offset from the bin centre."""
+        in the offset from the bin centre; the calibration factor (smooth)
+        is part of ``slow``."""
         name = interferometer.name
         r0, r1 = {}, {}
         if any("coprecessing" not in waveform_polarizations[f"{ell},{emm}"]
@@ -1744,6 +1767,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
             shared=shared,
             split=True)
         for mode_key, (fast, slow) in factors.items():
+            if calibration is not None:
+                slow = slow * calibration
             ratio = fast / self.per_detector_per_mode_fiducial_waveform_points[name][mode_key]
             r0[mode_key], r1[mode_key] = split_scheme_coefficients(ratio, slow, self.bin_widths)
         return r0, r1
