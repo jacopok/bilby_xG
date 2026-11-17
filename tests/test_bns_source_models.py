@@ -30,7 +30,13 @@ def test_mlgw_bns_modes():
 
 
 def test_mlgw_bns_modes_match_the_surrogate():
-    """Per mode, the model's own h_+ - i h_x (at azimuth 0, i.e. phase pi/2)."""
+    """Per mode, the model's own h_+ + i h_x (at azimuth 0, i.e. phase pi/2).
+
+    ``predict_modes_dict`` returns h_+ + i h_x = h_lm Y_lm for each mode
+    (m > 0, positive frequencies). The other combination, h_+ - i h_x, is
+    smaller by |Y_l,-m / Y_lm|, e.g. ((1 - cos i) / (1 + cos i))^2 for
+    l = |m|: 9.8e-4 at i = 0.35.
+    """
     pytest.importorskip("mlgw_bns")
     from mlgw_bns import ParametersWithExtrinsic
     from bilby_xG.source import (_mlgw_bns_model, convert_to_mlgw_bns_parameters,
@@ -49,7 +55,7 @@ def test_mlgw_bns_modes_match_the_surrogate():
         # mlgw_bns' batched evaluation reproduces predict_modes_dict to the
         # rounding of phases of up to ~1e6 rad
         scale = np.max(np.abs(expected[(ell, emm)]))
-        np.testing.assert_allclose((pols["plus"] - 1j * pols["cross"]) / scale,
+        np.testing.assert_allclose((pols["plus"] + 1j * pols["cross"]) / scale,
                                    expected[(ell, emm)] / scale, rtol=0, atol=1e-7)
 
 
