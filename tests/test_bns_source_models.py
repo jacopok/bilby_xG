@@ -67,6 +67,25 @@ def test_mlgw_bns_modes_accept_small_lambda():
             {key: params[key] for key in SOURCE_KEYS}, chi1z=0.9))
 
 
+
+def test_mlgw_bns_modes_scale_with_the_total_mass():
+    """Above the stored range (2-4 Msun): finite, and an exact rescaling,
+    h(f; M) = (M / M0)^2 h(f M / M0; M0), time to merger as M."""
+    pytest.importorskip("mlgw_bns")
+    from bilby_xG.source import convert_to_mlgw_bns_parameters, mlgw_bns_individual_modes
+
+    params, _ = convert_to_mlgw_bns_parameters(dict(PARAMETERS))
+    kwargs = {key: params[key] for key in SOURCE_KEYS}
+    freqs = np.geomspace(5.0, 400.0, 30)
+    small = mlgw_bns_individual_modes(freqs, **dict(kwargs, M=3.0))
+    large = mlgw_bns_individual_modes(freqs * 3.0 / 6.0, **dict(kwargs, M=6.0))
+    for mode, pols in small.items():
+        for key in ("plus", "cross"):
+            assert np.all(np.isfinite(large[mode][key]))
+            np.testing.assert_allclose(large[mode][key], 4.0 * pols[key], rtol=1e-8)
+        np.testing.assert_allclose(large[mode]["time_to_merger"],
+                                   2.0 * pols["time_to_merger"], rtol=1e-12)
+
 PRECESSING = dict(chirp_mass=1.2, mass_ratio=0.8, a_1=0.3, a_2=0.2, tilt_1=1.2, tilt_2=2.0,
                   phi_12=1.0, phi_jl=0.7, lambda_1=400.0, lambda_2=900.0,
                   luminosity_distance=40.0, theta_jn=0.9, phase=0.4)

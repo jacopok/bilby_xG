@@ -1849,6 +1849,14 @@ def _mlgw_bns_model():
     Its stored parameter ranges reject lambda < 5 (a guard for TEOBResumS
     during training); the surrogate itself is fine down to 0, which a flat
     tidal prior reaches, so that bound is relaxed.
+
+    The stored total-mass range is 2-4 Msun, but detector-frame BNS masses
+    reach about 6 Msun already at redshift 1 (and more for third-generation
+    detectors). The surrogate works in the reduced frequency M f: the total
+    mass is an exact rescaling (amplitude as M^2, times as M, phase
+    unchanged), so the upper bound is removed. The lower bound is kept: a
+    smaller mass moves a given frequency to a lower M f, toward the low end
+    of the surrogate's band.
     """
     global _MLGW_BNS_MODEL
     if _MLGW_BNS_MODEL is None:
@@ -1860,7 +1868,8 @@ def _mlgw_bns_model():
         ranges = model.parameter_ranges
         model.parameter_ranges = replace(
             ranges, lambda1_range=(0.0, ranges.lambda1_range[1]),
-            lambda2_range=(0.0, ranges.lambda2_range[1]))
+            lambda2_range=(0.0, ranges.lambda2_range[1]),
+            mass_range=(ranges.mass_range[0], np.inf))
         _MLGW_BNS_MODEL = model
     return _MLGW_BNS_MODEL
 
