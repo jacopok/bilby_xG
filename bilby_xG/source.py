@@ -2040,10 +2040,14 @@ def mlgw_bns_precessing_individual_modes(frequency_array, M, q, a_1, a_2, tilt_1
     and whose time-frequency map is that of the co-precessing mode, which the
     detector response takes from the key's ``m``.
 
-    ``hx`` follows LALSuite: it is minus mlgw_bns' (see mlgw_bns' known
-    issues), so the polarisations agree with IMRPhenomXPHM's in the same
-    parameters (the aligned :func:`mlgw_bns_individual_modes` keeps
-    mlgw_bns' own sign).
+    ``hx`` is mlgw_bns' own, which has LALSuite's sign relative to ``h+``
+    since mlgw_bns 2.0 (its changelog: "The sign of ``hx``"), as the aligned
+    :func:`mlgw_bns_individual_modes`: the polarisations agree with
+    IMRPhenomXP_NRTidalv2's in the same parameters (and, with the spins
+    along L, with the aligned source's). Before, this source negated ``hx``
+    to undo mlgw_bns 1's sign, which mlgw_bns 2 had already fixed: the
+    waveform was the binary's mirror image (``theta_jn -> pi - theta_jn``
+    for aligned spins), and a posterior on data had ``theta_jn`` mirrored.
 
     Evaluated on the ``frequency_bin_edges`` waveform argument when given,
     otherwise on ``frequency_array``; zero below ``minimum_frequency``
@@ -2100,12 +2104,12 @@ def mlgw_bns_precessing_individual_modes(frequency_array, M, q, a_1, a_2, tilt_1
     polarizations = {}
     for ell, emm in modes:
         j = MLGW_BNS_MODES.index((ell, emm))
-        # hx with LALSuite's sign
+        # hx as mlgw_bns' (LALSuite's sign since mlgw_bns 2.0)
         mode = {"plus": full(c_plus[j] * coprecessing[j]),
-                "cross": full(-c_cross[j] * coprecessing[j])}
+                "cross": full(c_cross[j] * coprecessing[j])}
         if kwargs.get("return_twist", False):
             mode.update(coprecessing=full(coprecessing[j]), c_plus=full(c_plus[j]),
-                        c_cross=full(-c_cross[j]))
+                        c_cross=full(c_cross[j]))
         polarizations[f"{ell},{emm}"] = mode
     return polarizations
 

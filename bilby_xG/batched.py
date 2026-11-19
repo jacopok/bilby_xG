@@ -127,10 +127,10 @@ def mlgw_bns_precessing_jax_modes(mode_array, frequencies, waveform_arguments, t
         def full(values):
             return jnp.zeros(shape, complex).at[..., index].set(values[..., 1:])
 
-        # hx with LALSuite's sign, as the numpy source
+        # hx as mlgw_bns' (LALSuite's sign), as the numpy source
         if twist:
-            return full(coprecessing), full(c_plus), full(-c_cross)
-        return full(c_plus * coprecessing), full(-c_cross * coprecessing)
+            return full(coprecessing), full(c_plus), full(c_cross)
+        return full(c_plus * coprecessing), full(c_cross * coprecessing)
 
     return modes
 

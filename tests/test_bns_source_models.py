@@ -30,7 +30,9 @@ def test_mlgw_bns_modes():
 
 
 def test_mlgw_bns_modes_match_the_surrogate():
-    """Per mode, the model's own h_+ - i h_x (at azimuth 0, i.e. phase pi/2)."""
+    """Per mode, the model's own h_+ + i h_x (at azimuth 0, i.e. phase pi/2):
+    mlgw_bns' ``predict_modes_dict`` gives each mode's contribution to it
+    since mlgw_bns 2.0, with LALSuite's sign of h_x."""
     pytest.importorskip("mlgw_bns")
     from mlgw_bns import ParametersWithExtrinsic
     from bilby_xG.source import (_mlgw_bns_model, convert_to_mlgw_bns_parameters,
@@ -49,7 +51,7 @@ def test_mlgw_bns_modes_match_the_surrogate():
         # mlgw_bns' batched evaluation reproduces predict_modes_dict to the
         # rounding of phases of up to ~1e6 rad
         scale = np.max(np.abs(expected[(ell, emm)]))
-        np.testing.assert_allclose((pols["plus"] - 1j * pols["cross"]) / scale,
+        np.testing.assert_allclose((pols["plus"] + 1j * pols["cross"]) / scale,
                                    expected[(ell, emm)] / scale, rtol=0, atol=1e-7)
 
 
@@ -100,8 +102,8 @@ def test_mlgw_bns_precessing_conversion():
 
 
 def test_mlgw_bns_precessing_modes_sum_to_the_surrogate():
-    """The modes add up to mlgw_bns' precessing h_+ and (with LALSuite's
-    sign) h_x, and are zero below the minimum frequency."""
+    """The modes add up to mlgw_bns' precessing h_+ and h_x, and are zero
+    below the minimum frequency."""
     pytest.importorskip("jax")
     pytest.importorskip("mlgw_bns")
     from mlgw_bns.batched_precession import batch_arguments
@@ -131,7 +133,7 @@ def test_mlgw_bns_precessing_modes_sum_to_the_surrogate():
     np.testing.assert_allclose(sum(p["plus"] for p in modes.values())[2:] / scale,
                                plus / scale, rtol=0, atol=2e-3)
     np.testing.assert_allclose(sum(p["cross"] for p in modes.values())[2:] / scale,
-                               -cross / scale, rtol=0, atol=2e-3)
+                               cross / scale, rtol=0, atol=2e-3)
 
 
 def test_mlgw_bns_precessing_modes_do_not_depend_on_the_grid():
@@ -150,7 +152,8 @@ def test_mlgw_bns_precessing_modes_do_not_depend_on_the_grid():
 
 def test_mlgw_bns_precessing_aligned_limit():
     """With the spins along L, each mode is the aligned source's up to a
-    constant phase (the two are referenced to different points)."""
+    constant phase (the two are referenced to different points), the same
+    for h_+ and h_x: a relative sign of h_x (the mirror image) would not be."""
     pytest.importorskip("jax")
     pytest.importorskip("mlgw_bns")
     from bilby_xG.source import convert_to_mlgw_bns_parameters, mlgw_bns_individual_modes
@@ -162,10 +165,57 @@ def test_mlgw_bns_precessing_aligned_limit():
         parameters, chi_1=parameters["a_1"], chi_2=-parameters["a_2"]))
     aligned = mlgw_bns_individual_modes(freqs, **{key: params[key] for key in SOURCE_KEYS})
     for key, pols in precessing.items():
+        offset = pols["plus"][0] / aligned[key]["plus"][0]
         for pol in ("plus", "cross"):
             ratio = pols[pol] / aligned[key][pol]
             np.testing.assert_allclose(np.abs(ratio), 1, atol=1e-6)
-            np.testing.assert_allclose(ratio / ratio[0], 1, atol=1e-2)
+            np.testing.assert_allclose(ratio / offset, 1, atol=1e-2)
+
+
+@pytest.mark.parametrize("spins", [
+    dict(a_1=0.0, a_2=0.0, tilt_1=0.0, tilt_2=0.0, phi_12=0.0, phi_jl=0.0, theta_jn=2.5),
+    dict(a_1=0.3, a_2=0.2, tilt_1=1.0, tilt_2=2.0, phi_12=0.5, phi_jl=1.0, theta_jn=2.5),
+    dict(a_1=0.4, a_2=0.1, tilt_1=1.4, tilt_2=0.7, phi_12=2.5, phi_jl=4.0, theta_jn=0.6),
+])
+def test_mlgw_bns_precessing_matches_lalsuite(spins):
+    """The (2,2) co-precessing mode, twisted, is IMRPhenomXP_NRTidalv2's
+    h_+ and h_x in the same LVK parameters: the match of the pair (h_+,
+    h_x), with one time shift and one constant phase for both, is high. It
+    is ~0.03 for the mirror image (h_x negated), which a match of a single
+    projection F_+ h_+ + F_x h_x, maximised over the phase, cannot see."""
+    pytest.importorskip("jax")
+    pytest.importorskip("mlgw_bns")
+    bilby_source = pytest.importorskip("bilby.gw.source")
+    pytest.importorskip("lalsimulation")
+    from bilby_xG.source import convert_to_mlgw_bns_precessing_parameters
+
+    df, f_low, f_high = 1 / 16, 20.0, 1024.0
+    full = np.arange(0, 2048, df)
+    band = (full >= f_low) & (full <= f_high)
+    parameters = dict(PRECESSING, **spins)
+    modes = _precessing_modes(full[band], parameters, mode_array=[[2, 2]],
+                              reference_frequency=20.0, minimum_frequency=f_low)["2,2"]
+    params, _ = convert_to_mlgw_bns_precessing_parameters(dict(parameters))
+    lal = bilby_source.lal_binary_neutron_star(
+        full, mass_1=params["mass_1"], mass_2=params["mass_2"],
+        luminosity_distance=parameters["luminosity_distance"],
+        lambda_1=parameters["lambda_1"], lambda_2=parameters["lambda_2"],
+        phase=parameters["phase"], **spins,
+        waveform_approximant="IMRPhenomXP_NRTidalv2", reference_frequency=20.0,
+        minimum_frequency=f_low)
+
+    def joint_match(a, b):
+        weight = full[band] ** (-7 / 3)  # a rough inspiral weighting
+        product = np.zeros(len(full), complex)
+        product[band] = sum(x * np.conj(y) for x, y in zip(a, b)) * weight
+        norm = np.sqrt(sum(np.sum(np.abs(x) ** 2 * weight) for x in a)
+                       * sum(np.sum(np.abs(y) ** 2 * weight) for y in b))
+        return np.abs(np.fft.ifft(product)).max() * len(full) / norm
+
+    ours = (modes["plus"], modes["cross"])
+    theirs = (lal["plus"][band], lal["cross"][band])
+    assert joint_match(ours, theirs) > 0.97
+    assert joint_match((ours[0], -ours[1]), theirs) < 0.5
 
 
 def test_mlgw_bns_precessing_modes_out_of_range():
