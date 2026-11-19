@@ -19,10 +19,13 @@ not needed: it only enters the likelihood's summary data, once the bins are
 fixed. The noise term dropped this way, <n | h_test - h_RB>, is smaller than
 the kept one by ~sqrt(2 SNR^2 mismatch).
 
-Everything is evaluated on a geometric frequency grid, so integrals over any
-[grid[a], grid[b]] come from prefix sums in O(1) and index bisection is
-bisection in log f. The results do not depend on the grid size (checked from
-15k to 480k points for a BNS in ET from 3 and 10 Hz).
+Everything is evaluated on a geometric frequency grid, so index bisection
+is bisection in log f. The exact log-likelihood over any [grid[a], grid[b]]
+comes from prefix sums in O(1); the summary data (moments about the bin
+centre) are summed over the bin, which prefix sums would cancel
+catastrophically (:meth:`GridModel.bin_moments`). The results do not depend
+on the grid size (checked from 15k to 480k points for a BNS in ET from 3 and
+10 Hz).
 
 Diagnostics, all against the same grid quadrature (zero noise):
   * bins and held-out validation error as a function of the number of
@@ -229,15 +232,60 @@ class GridModel:
         self.d = self.h0.sum(axis=1) if data is None else np.asarray(data)
         self.residual_max = 0.0
         weight = 4 / self.psd[:, None, :]
-        a = np.conj(self.h0) * self.d[:, None, :] * weight
-        self.A0 = trapezoid_prefix(a, freqs)
-        self.A1 = trapezoid_prefix(a * freqs, freqs)
+        # the summary data's integrands at the grid nodes; their moments
+        # about each bin's centre are summed over the bin (bin_moments)
+        self.a = np.conj(self.h0) * self.d[:, None, :] * weight
         # b[i, k, kp] = conj(h0_kp) h0_k / S, as in the likelihood's summary data
-        b = self.h0[:, :, None, :] * np.conj(self.h0[:, None, :, :]) * weight[:, None]
-        self.B0 = trapezoid_prefix(b, freqs)
-        self.B1 = trapezoid_prefix(b * freqs, freqs)
-        self.B2 = trapezoid_prefix(b * freqs ** 2, freqs) if second_order else None
+        self.b = self.h0[:, :, None, :] * np.conj(self.h0[:, None, :, :]) * weight[:, None]
         self.norm_d = float(np.real(4 * np.trapezoid(np.abs(self.d) ** 2 / self.psd, x=freqs).sum()))
+
+    #: grid segments summed at once by :meth:`bin_moments` (memory bound)
+    MOMENT_CHUNK = 100_000
+
+    def bin_moments(self, lo, hi):
+        """The summary data of the bins [freqs[lo], freqs[hi]] (index
+        arrays): the trapezoid sums of a and b times (f - f_c)^k, f_c the
+        bin's centre, as the likelihood computes them, (A0, A1, B0, B1, B2)
+        with the bins on the last axis (B2 None without ``second_order``).
+
+        They are summed over each bin's own segments, in f - f_c. Prefix
+        sums of a f^k and b f^k would give them in O(1) per bin, but as
+        differences of running totals (~ <h|h> f^k at f, 2e9 for b f^2 at
+        2.7 kHz in ET) that cancel to a single cell's ~1e-5 absolute error;
+        times the |r1|^2 = 1 / df^2 of a ratio that drops to 0 within one
+        cell (a test waveform ending there), that is a ~1e-4 log-likelihood
+        error that no bisection removes."""
+        lo, hi = np.asarray(lo, dtype=int), np.asarray(hi, dtype=int)
+        moments = [[] for _ in range(5)]
+        lengths = hi - lo
+        ends = np.cumsum(lengths)
+        start = 0
+        while start < len(lo):
+            # whole bins, at most MOMENT_CHUNK segments (or one wider bin)
+            stop = max(start + 1, int(np.searchsorted(
+                ends, (ends[start - 1] if start else 0) + self.MOMENT_CHUNK, side="right")))
+            for out, m in zip(moments, self._bin_moments(lo[start:stop], hi[start:stop])):
+                out.append(m)
+            start = stop
+        A0, A1, B0, B1, B2 = (np.concatenate(m, axis=-1) if m[0] is not None else None
+                              for m in moments)
+        return A0, A1, B0, B1, B2
+
+    def _bin_moments(self, lo, hi):
+        lengths = hi - lo
+        offsets = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+        # the segments [seg, seg + 1] of each bin, bins one after the other
+        seg = np.repeat(lo - offsets, lengths) + np.arange(lengths.sum())
+        fc = np.repeat(0.5 * (self.freqs[lo] + self.freqs[hi]), lengths)
+        half = 0.5 * (self.freqs[seg + 1] - self.freqs[seg])
+        x_lo, x_hi = self.freqs[seg] - fc, self.freqs[seg + 1] - fc
+
+        def summed(g, k):
+            terms = g[..., seg] * (half * x_lo ** k) + g[..., seg + 1] * (half * x_hi ** k)
+            return np.add.reduceat(terms, offsets, axis=-1)
+
+        return (summed(self.a, 0), summed(self.a, 1), summed(self.b, 0), summed(self.b, 1),
+                summed(self.b, 2) if self.second_order else None)
 
     def set_maximum(self, h_max):
         """Take ``h_max`` (n_ifo, n_mode, n_freq) as the maximum-likelihood
@@ -245,33 +293,26 @@ class GridModel:
         self.residual_max = 0.0
         self.residual_max = -delta_log_likelihood(self, h_max)
 
-    def relative_binning_terms(self, lo, hi, r_lo, r_hi):
+    def relative_binning_terms(self, lo, hi, r_lo, r_hi, moments=None):
         """Relative-binning Re<d|h> - ||h||^2 / 2 in each of the bins
         [freqs[lo], freqs[hi]] (index arrays), from the ratios h / h_fid at
         their edges, (n_ifo, n_mode, n_bins) each: the linear-ratio
-        approximation of the likelihood (with the r1 r1* term, or none)."""
-        dh, hh = self.relative_binning_products(lo, hi, r_lo, r_hi)
+        approximation of the likelihood (with the r1 r1* term, or none).
+        ``moments``: the bins' :meth:`bin_moments`, if already computed."""
+        dh, hh = self.relative_binning_products(lo, hi, r_lo, r_hi, moments)
         return np.sum(np.real(dh) - 0.5 * hh, axis=0)
 
-    def relative_binning_products(self, lo, hi, r_lo, r_hi):
+    def relative_binning_products(self, lo, hi, r_lo, r_hi, moments=None):
         """The <d|h> (complex) and ||h||^2 of :meth:`relative_binning_terms`,
         (n_ifo, n_bins) each."""
-        f_lo, f_hi = self.freqs[lo], self.freqs[hi]
-        fc = 0.5 * (f_lo + f_hi)
+        A0, A1, B0, B1, B2 = self.bin_moments(lo, hi) if moments is None else moments
         r0 = 0.5 * (r_lo + r_hi)
-        r1 = (r_hi - r_lo) / (f_hi - f_lo)
-        A0 = self.A0[..., hi] - self.A0[..., lo]
-        A1 = self.A1[..., hi] - self.A1[..., lo] - fc * A0
-        B0 = self.B0[..., hi] - self.B0[..., lo]
-        B1 = self.B1[..., hi] - self.B1[..., lo] - fc * B0
+        r1 = (r_hi - r_lo) / (self.freqs[hi] - self.freqs[lo])
         dh = np.sum(A0 * np.conj(r0) + A1 * np.conj(r1), axis=1)
         hh = (np.einsum("ikpb,ikb,ipb->ib", B0, r0, np.conj(r0))
               + np.einsum("ikpb,ikb,ipb->ib", B1, r0, np.conj(r1))
               + np.einsum("ikpb,ipb,ikb->ib", B1, np.conj(r0), r1))
         if self.second_order:
-            # sum b (f - f_c)^2, from the prefix sums of b, b f and b f^2
-            B2 = (self.B2[..., hi] - self.B2[..., lo]
-                  - 2 * fc * (self.B1[..., hi] - self.B1[..., lo]) + fc ** 2 * B0)
             hh = hh + np.einsum("ikpb,ikb,ipb->ib", B2, r1, np.conj(r1))
         return dh, np.real(hh)
 
@@ -324,41 +365,141 @@ class GridPoint:
         self.E = trapezoid_prefix(integrand, model.freqs).sum(axis=0)
         self.delta_log_likelihood = delta_log_likelihood(model, h_test)
 
-    def bin_errors(self, lo, hi):
+    def bin_errors(self, lo, hi, moments=None):
         """Signed exact - relative-binning log-likelihood error for the bins
         [freqs[lo], freqs[hi]] (index arrays), with the same linear-ratio
-        approximation (and the same r1 r1* term, or none) as the likelihood."""
+        approximation (and the same r1 r1* term, or none) as the likelihood.
+        ``moments``: the bins' :meth:`GridModel.bin_moments` (they depend on
+        the fiducial waveform only), if already computed."""
         approx = self.model.relative_binning_terms(
-            lo, hi, self.ratio[..., lo], self.ratio[..., hi])
+            lo, hi, self.ratio[..., lo], self.ratio[..., hi], moments)
         return self.E[hi] - self.E[lo] - approx
 
-    def total_error(self, edges):
+    def total_error(self, edges, moments=None):
         """Relative-binning minus exact log-likelihood ratio for bin edges
         (grid indices); relative binning is exact at the fiducial point."""
-        return -float(np.sum(self.bin_errors(edges[:-1], edges[1:])))
+        return -float(np.sum(self.bin_errors(edges[:-1], edges[1:], moments)))
 
 
-def select_bins(points, eta, initial_number_of_bins=200, max_iterations=50):
+def select_bins(points, eta, initial_number_of_bins=200, max_iterations=50,
+                return_floor=False):
     """GETBINS with a max over test points: bisect (in grid index, i.e.
     log f) until every bin's |error| at every point is <= eta / n_bins, then
-    iterate n_bins to self-consistency. Returns grid indices of the edges."""
-    n = len(points[0].model.freqs)
+    iterate n_bins to self-consistency. Returns grid indices of the edges.
+
+    A single grid cell is not split further even when its error is above
+    the budget: that error is the grid's, which no binning removes. With
+    ``return_floor`` also returns their total, the largest over points of
+    the sum of |error| over such cells (0 if there are none)."""
+    model = points[0].model
+    n = len(model.freqs)
     target, previous, iterations = initial_number_of_bins, None, 0
     while previous != target and iterations < max_iterations:
         budget = eta / target
-        accepted = []
+        accepted, floor = [], np.zeros(len(points))
         pending = [(0, n - 1)]
         while pending:
             lo, hi = np.array(pending).T
-            error = np.max([np.abs(p.bin_errors(lo, hi)) for p in points], axis=0)
-            split = (error > budget) & (hi - lo > 1)
+            moments = model.bin_moments(lo, hi)
+            errors = np.abs([p.bin_errors(lo, hi, moments) for p in points])
+            error = errors.max(axis=0)
+            over = error > budget
+            split = over & (hi - lo > 1)
+            floor += errors[:, over & ~split].sum(axis=1)
             accepted.extend(zip(lo[~split], hi[~split]))
             mid = (lo[split] + hi[split]) // 2
             pending = list(zip(lo[split], mid)) + list(zip(mid, hi[split]))
         edges = np.unique(np.array(accepted).ravel())
         previous, target = target, len(edges) - 1
         iterations += 1
-    return edges
+    return (edges, float(floor.max())) if return_floor else edges
+
+
+#: an eta step by a factor below this is checked for a stalled evidence bias
+STALL_ETA_RATIO = 0.5
+#: stalled: the bias fell by less than (eta ratio)^this (nominally 1, error ~ eta)
+STALL_SLOPE = 0.25
+#: on failure, the cheapest trial with a bias within this factor of the lowest
+SAME_BIAS = 1.1
+#: consecutive stalled steps that stop the search
+STALL_STEPS = 2
+#: stop once a passing and a failing eta are within this factor
+BRACKET_RATIO = 1.25
+
+
+def tune_eta(select, bias_of, eta, evidence_tolerance, max_iterations):
+    """Rescale eta (error ~ eta) until the evidence bias is within
+    [evidence_tolerance / 2, evidence_tolerance], keeping the largest eta
+    that meets the tolerance.
+
+    ``select(eta)`` returns (edges, floor) as :func:`select_bins` with
+    ``return_floor``; ``bias_of(edges)`` the evidence bias of the edges.
+
+    The search stops early when the bias stops responding before any trial
+    meets the tolerance: after STALL_STEPS consecutive eta steps down by
+    more than 1 / STALL_ETA_RATIO, each with a bias that fell by less than
+    (eta ratio)^STALL_SLOPE, the bias is set by something more bins do not
+    reduce (the grid quadrature, the waveform), and finer bins would only
+    make the likelihood dearer. Without a trial meeting the tolerance, the
+    cheapest one with a bias within SAME_BIAS of the lowest is kept.
+
+    The bias need not scale with eta: it can drop by orders of magnitude
+    over a small range of eta (once the bins resolve where test waveforms
+    end), and the proportional step then jumps back and forth across the
+    drop. Once an eta that passes is below one that fails, the next eta is
+    kept between them (their geometric mean, if the proportional step
+    leaves the bracket), and the search stops when they are within
+    BRACKET_RATIO.
+
+    Returns (eta, edges, bias, history, met): history has one dict per trial
+    (eta, n_bins, evidence_bias, floor); met is whether the tolerance was."""
+    history, trials, best, stalled = [], [], None, 0
+    failing = np.inf  # the smallest eta that failed
+    for _ in range(max_iterations if evidence_tolerance is not None else 1):
+        edges, floor = select(eta)
+        bias = bias_of(edges)
+        history.append(dict(eta=eta, n_bins=len(edges) - 1, evidence_bias=bias, floor=floor))
+        trials.append((eta, edges, bias))
+        logger.info(f"Bin selection: eta = {eta:.4g}: {len(edges) - 1} bins, evidence bias "
+                    f"{bias:.3g} (tolerance {evidence_tolerance})"
+                    + (f", irreducible single-cell error up to {floor:.3g}" if floor else ""))
+        if evidence_tolerance is None:
+            return eta, edges, bias, history, True
+        if bias <= evidence_tolerance and (best is None or eta > best[0]):
+            best = (eta, edges, bias)
+        if 0.5 * evidence_tolerance <= bias <= evidence_tolerance:
+            break
+        if bias > evidence_tolerance:
+            failing = min(failing, eta)
+        if best is None and len(history) > 1:
+            previous = history[-2]
+            ratio = eta / previous["eta"]
+            stalled = stalled + 1 if (
+                ratio < STALL_ETA_RATIO
+                and bias > previous["evidence_bias"] * ratio ** STALL_SLOPE) else 0
+            if stalled >= STALL_STEPS:
+                logger.warning(
+                    f"Bin selection: evidence bias stalled ({history[-1 - stalled]['evidence_bias']:.3g} "
+                    f"at {history[-1 - stalled]['n_bins']} bins, {bias:.3g} at {len(edges) - 1}): "
+                    f"not reduced by more bins; stopping")
+                break
+        proposal = eta * 0.75 * evidence_tolerance / max(bias, 1e-300)
+        if best is not None and best[0] < failing:
+            if failing / best[0] < BRACKET_RATIO:
+                break
+            if not best[0] < proposal < failing:
+                proposal = float(np.sqrt(best[0] * failing))
+        eta = proposal
+    if best is not None:
+        return (*best, history, True)
+    lowest = min(t[2] for t in trials)
+    eta, edges, bias = min((t for t in trials if t[2] <= SAME_BIAS * lowest),
+                           key=lambda t: len(t[1]))
+    logger.warning(f"Bin selection: evidence tolerance {evidence_tolerance:g} not met in "
+                   f"{len(trials)} trials{' (stalled)' if stalled >= STALL_STEPS else ''}; using the "
+                   f"cheapest within {SAME_BIAS:g}x of the lowest bias: {len(edges) - 1} bins, "
+                   f"eta = {eta:.4g}, bias {bias:.3g}")
+    return eta, edges, bias, history, False
 
 
 class PointFinder:
@@ -646,29 +787,14 @@ def select_relative_binning_bins(
                 f"{time.time() - t0:.0f} s")
 
     def errors(points, set_edges):
-        return np.array([p.total_error(set_edges) for p in points])
+        moments = model.bin_moments(set_edges[:-1], set_edges[1:])
+        return np.array([p.total_error(set_edges, moments) for p in points])
 
     t0 = time.time()
-    eta_history, best = [], None
-    for _ in range(max_eta_iterations if evidence_tolerance is not None else 1):
-        trial = select_bins(train_points, eta)
-        bias = evidence_bias(errors(evidence_points, trial))
-        eta_history.append(dict(eta=eta, n_bins=len(trial) - 1, evidence_bias=bias))
-        logger.info(f"Bin selection: eta = {eta:.4g}: {len(trial) - 1} bins, evidence "
-                    f"bias {bias:.3g} (tolerance {evidence_tolerance})")
-        if evidence_tolerance is None:
-            best = (eta, trial, bias)
-            break
-        if bias <= evidence_tolerance and (best is None or eta > best[0]):
-            best = (eta, trial, bias)
-        if 0.5 * evidence_tolerance <= bias <= evidence_tolerance:
-            break
-        eta *= 0.75 * evidence_tolerance / max(bias, 1e-300)
-    if best is None:
-        logger.warning(f"Bin selection: evidence tolerance {evidence_tolerance:g} not met "
-                       f"in {max_eta_iterations} iterations; using the last eta")
-        best = (eta_history[-1]["eta"], trial, eta_history[-1]["evidence_bias"])
-    eta, edges, bias = best
+    eta, edges, bias, eta_history, tolerance_met = tune_eta(
+        lambda e: select_bins(train_points, e, return_floor=True),
+        lambda trial: evidence_bias(errors(evidence_points, trial)),
+        eta, evidence_tolerance, max_eta_iterations)
     bin_freqs = freqs[edges]
     logger.info(f"Bin selection: {len(edges) - 1} bins (eta = {eta:.4g}, {len(train)} "
                 f"training points, evidence bias {bias:.3g}) in {time.time() - t0:.0f} s")
@@ -696,7 +822,8 @@ def select_relative_binning_bins(
 
     summary = dict(
         eta=eta, eta_history=eta_history, evidence_bias=bias,
-        evidence_tolerance=evidence_tolerance, effective_dimension=effective_dimension,
+        evidence_tolerance=evidence_tolerance, evidence_tolerance_met=tolerance_met,
+        effective_dimension=effective_dimension,
         n_live=n_live, evidence_delta_log_likelihood=(-evidence_d).tolist(),
         target_mismatch=target_mismatch, n_grid=n_grid,
         minimum_frequency=float(freqs[0]), maximum_frequency=float(freqs[-1]),

@@ -119,3 +119,154 @@ def test_tolerance_none_keeps_eta(selection):
     # the same first trial, the tuned one goes on to finer bins
     assert tuned["eta_history"][0] == fixed["eta_history"][0]
     assert fixed["evidence_bias"] > 1e-5 and tuned["n_bins"] > fixed["n_bins"]
+
+
+class _PSD:
+    def __init__(self, scale):
+        self.scale = scale
+
+    def get_power_spectral_density_array(self, freqs):
+        return self.scale * (1 + (10 / freqs) ** 4 + (freqs / 500) ** 2)
+
+
+class _Ifo:
+    def __init__(self, scale):
+        self.power_spectral_density = _PSD(scale)
+
+
+class _Projector:
+    """Two detectors, two modes, an ET-like inspiral (SNR ~ 600 up to
+    2.7 kHz, as stages_AS_HF_Delta_d1019); ``parameters`` scale the phase
+    and give the frequency where the waveform ends (zero above)."""
+    m = np.array([2, 3])
+
+    def __init__(self):
+        self.interferometers = [_Ifo(1.0), _Ifo(1.3)]
+
+    def project(self, parameters, freqs):
+        phase = parameters["phase_scale"] * 1e3 * (freqs / 10) ** (-5 / 3)
+        amplitude = np.array([1.0, 0.1])[:, None] * freqs ** (-7 / 6)
+        h = amplitude * np.exp(1j * self.m[:, None] * phase / 2)
+        h = np.where(freqs <= parameters["cutoff"], h, 0)
+        h = np.array([h, 0.8 * h * np.exp(0.3j)])
+        return 1.33e3 * h
+
+
+@pytest.fixture(scope="module")
+def cutoff_model():
+    from bilby_xG.bin_selection import GridModel
+    projector = _Projector()
+    freqs = np.geomspace(6.0, 2677.3819307399895, 30_001)
+    fiducial = dict(phase_scale=1.0, cutoff=freqs[-1])
+    return projector, GridModel(projector, fiducial, freqs)
+
+
+def test_bin_moments_are_the_bins_trapezoid_sums(cutoff_model):
+    _, model = cutoff_model
+    f = model.freqs
+    lo = np.array([0, 17, 1000, 29_000, 29_999])
+    hi = np.array([5, 18, 21_000, 30_000, 30_000])
+    A0, A1, B0, B1, B2 = model.bin_moments(lo, hi)
+    for j, (a, b) in enumerate(zip(lo, hi)):
+        x = f[a:b + 1] - 0.5 * (f[a] + f[b])
+        for k, (got_a, got_b) in enumerate([(A0, B0), (A1, B1), (None, B2)]):
+            expected_b = np.trapezoid(model.b[..., a:b + 1] * x ** k, x=f[a:b + 1], axis=-1)
+            assert np.allclose(got_b[..., j], expected_b, rtol=1e-10, atol=0)
+            if got_a is not None:
+                expected_a = np.trapezoid(model.a[..., a:b + 1] * x ** k, x=f[a:b + 1], axis=-1)
+                assert np.allclose(got_a[..., j], expected_a, rtol=1e-10, atol=0)
+    # chunked (bins summed a few at a time) as in one go
+    model.MOMENT_CHUNK = 7
+    try:
+        chunked = model.bin_moments(lo, hi)
+    finally:
+        del model.MOMENT_CHUNK
+    for got, expected in zip(chunked, (A0, A1, B0, B1, B2)):
+        assert np.allclose(got, expected, rtol=1e-13, atol=0)
+
+
+def test_single_cell_bins_are_exact_where_the_waveform_ends(cutoff_model):
+    """One bin per grid cell reproduces the grid quadrature, also for a test
+    waveform ending inside the last cell (its ratio drops from ~1 to 0):
+    prefix-sum moments gave ~1e-4 there (stages_AS_HF_Delta_d1019)."""
+    from bilby_xG.bin_selection import GridPoint
+    projector, model = cutoff_model
+    f = model.freqs
+    assert 3e5 < model.norm_d < 5e5
+    edges = np.arange(len(f))
+    for cutoff in (f[-1] - 1e-3, f[-4] - 1e-3, f[-1]):
+        h = projector.project(dict(phase_scale=1 + 5e-6, cutoff=cutoff), f)
+        point = GridPoint(model, h)
+        assert 1 < -point.delta_log_likelihood < 100
+        assert abs(point.total_error(edges)) < 1e-8
+
+
+def test_select_bins_reports_the_single_cell_floor():
+    from bilby_xG.bin_selection import select_bins
+
+    class Model:
+        freqs = np.arange(1025.0)
+
+        def bin_moments(self, lo, hi):
+            return None
+
+    class Point:
+        """Error additive over cells, ~0 except in cell 700."""
+        model = Model()
+
+        def __init__(self, bad):
+            self.cells = np.full(1024, 1e-12)
+            self.cells[700] = bad
+            self.prefix = np.concatenate([[0], np.cumsum(self.cells)])
+
+        def bin_errors(self, lo, hi, moments=None):
+            assert moments is None
+            return self.prefix[hi] - self.prefix[lo]
+
+    edges, floor = select_bins([Point(1e-3), Point(-3e-4)], 1e-2, return_floor=True)
+    assert floor == pytest.approx(1e-3)
+    assert 700 in edges and 701 in edges
+    assert np.array_equal(select_bins([Point(1e-3)], 1e-2), edges)
+    assert select_bins([Point(1e-9)], 1e-2, return_floor=True)[1] == 0
+
+
+def _trials(bias_of_eta):
+    def select(eta):
+        return np.arange(int(1000 / eta) + 1), 0.0
+
+    return select, lambda edges: bias_of_eta(1000 / (len(edges) - 1))
+
+
+def test_tune_eta_converges_as_before():
+    from bilby_xG.bin_selection import tune_eta
+    eta, edges, bias, history, met = tune_eta(*_trials(lambda eta: 1e-4 * eta), 3.0, 1e-5, 8)
+    assert met and len(history) == 2 and 5e-6 <= bias <= 1e-5
+    assert eta == pytest.approx(3.0 * 0.75e-5 / 3e-4, rel=1e-2)
+
+
+def test_tune_eta_stops_on_a_stalled_bias_and_keeps_the_cheapest():
+    """A bias floor (6e-5) that more bins do not reduce: stop once the bias
+    stalls, keep the cheapest trial at the floor, not the last (finest)."""
+    from bilby_xG.bin_selection import tune_eta
+    from bilby_xG.bin_selection import SAME_BIAS, STALL_STEPS
+    eta, edges, bias, history, met = tune_eta(
+        *_trials(lambda eta: 3e-5 * eta + 6e-5), 3.0, 1e-5, 8)
+    assert not met
+    # stopped after STALL_STEPS unresponsive steps, not at the iteration limit
+    assert STALL_STEPS < len(history) < 8
+    lowest = min(h["evidence_bias"] for h in history)
+    cheapest = min(h["n_bins"] for h in history if h["evidence_bias"] <= SAME_BIAS * lowest)
+    assert len(edges) - 1 == cheapest < history[-1]["n_bins"]
+    assert bias <= SAME_BIAS * lowest
+
+
+def test_tune_eta_brackets_a_bias_that_drops_in_a_step():
+    """A bias that falls from 1e-3 to 1e-8 at eta = 0.3 (the bins resolving
+    where test waveforms end): the proportional step alone would jump
+    between ~0.02 and ~2; bracketing settles just below 0.3."""
+    from bilby_xG.bin_selection import BRACKET_RATIO, tune_eta
+    eta, edges, bias, history, met = tune_eta(
+        *_trials(lambda eta: 1e-3 if eta > 0.3 else 1e-8), 3.0, 1e-5, 8)
+    assert met and bias <= 1e-5
+    assert 0.3 / BRACKET_RATIO < eta <= 0.3 * 1.001
+    assert eta == max(h["eta"] for h in history if h["evidence_bias"] <= 1e-5)
