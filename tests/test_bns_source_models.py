@@ -1,5 +1,7 @@
 """Tests for the surrogate / EOB BNS source models (optional dependencies)."""
 import numpy as np
+
+from bilby_xG.source import MLGW_BNS_MODES
 import pytest
 
 PARAMETERS = dict(chirp_mass=1.2, mass_ratio=0.9, chi_1=0.01, chi_2=0.0,
@@ -26,7 +28,7 @@ def test_mlgw_bns_modes():
                                          frequency_bin_edges=freqs[2:])
     np.testing.assert_array_equal(on_edges["2,2"]["cross"], modes["2,2"]["cross"][2:])
     with pytest.raises(ValueError):
-        mlgw_bns_individual_modes(freqs, **kwargs, mode_array=[[3, 2]])
+        mlgw_bns_individual_modes(freqs, **kwargs, mode_array=[[5, 5]])  # not modelled
 
 
 def test_mlgw_bns_modes_match_the_surrogate():
@@ -116,7 +118,7 @@ def test_mlgw_bns_precessing_modes_sum_to_the_surrogate():
 
     freqs = np.concatenate([[0.0, 5.0], np.geomspace(10.0, 1500.0, 300)])
     modes = _precessing_modes(freqs, return_twist=True)
-    assert set(modes) == {"2,2", "2,1", "3,3", "4,4"}
+    assert set(modes) == {f"{ell},{emm}" for ell, emm in MLGW_BNS_MODES}
     for pols in modes.values():
         assert np.all(pols["plus"][:2] == 0) and np.all(np.abs(pols["plus"][2:]) > 0)
         np.testing.assert_allclose(pols["plus"], pols["c_plus"] * pols["coprecessing"])

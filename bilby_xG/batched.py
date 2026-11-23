@@ -87,7 +87,7 @@ def mlgw_bns_precessing_jax_modes(mode_array, frequencies, waveform_arguments, t
     same per-mode polarisations as
     :func:`bilby_xG.source.mlgw_bns_precessing_individual_modes` with the
     ``waveform_arguments`` (``reference_frequency``, ``minimum_frequency``,
-    ``precession_n_steps``), including the start of the precession
+    ``precession_n_steps``, ``mlgw_bns_model``), including the start of the precession
     integration (up to the rounding of the surrogate's regressors). Rows
     outside the surrogate's range are NaN.
     """
@@ -106,7 +106,8 @@ def mlgw_bns_precessing_jax_modes(mode_array, frequencies, waveform_arguments, t
     in_band = frequencies >= start
     # the angles are integrated from the first frequency
     grid = np.concatenate([[start], frequencies[in_band]])
-    predict = PrecessingModel(_mlgw_bns_model()).jax_predict_modes(mode_array, n_steps)
+    predict = PrecessingModel(_mlgw_bns_model(waveform_arguments.get("mlgw_bns_model"))
+                              ).jax_predict_modes(mode_array, n_steps)
 
     def modes(p):
         q = p["q"]
@@ -341,7 +342,8 @@ class BatchedRelativeBinningLikelihood(Likelihood):
             self._modes = mlgw_bns_precessing_jax_modes(
                 self.mode_array, self.frequencies, wfg.waveform_arguments, twist=self.split)
         else:
-            self._modes = mlgw_bns_jax_modes(_mlgw_bns_model(), self.mode_array)
+            self._modes = mlgw_bns_jax_modes(
+                _mlgw_bns_model(wfg.waveform_arguments.get("mlgw_bns_model")), self.mode_array)
         self._batched = jax.jit(self._batch)
 
     def _batch(self, p, arrays):

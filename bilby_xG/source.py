@@ -19,6 +19,8 @@ frequency-dependent antenna response can be applied mode-by-mode:
 The module owns its own non-destructive ``_base_lal_cbc_fd_waveform`` helper, so
 it is independent of upstream bilby's waveform-kwargs handling.
 """
+import os
+
 import numpy as np
 
 from bilby.core import utils
@@ -1837,32 +1839,50 @@ PARAMETER_SETS = dict(
 # mlgw_bns (optional dependency: ``pip install mlgw-bns``)
 # ---------------------------------------------------------------------------
 
-#: Modes of the pretrained mlgw_bns ``default_hom`` model.
-MLGW_BNS_MODES = [(2, 2), (2, 1), (3, 3), (4, 4)]
+#: Modes of the shipped mlgw_bns 2.1 models (``default_hom_lambda{2000,
+#: 4000, 8000, 12000}``, all the same); a model's own are checked on use.
+MLGW_BNS_MODES = [(2, 2), (2, 1), (3, 1), (3, 2), (3, 3), (4, 3), (4, 4)]
 
-_MLGW_BNS_MODEL = None
+#: Environment variable naming the shipped mlgw_bns model used where none is
+#: given (``mlgw_bns_model`` waveform argument): spawned workers inherit it,
+#: and functions that only see parameters (xg_pe.waveform_time) read it.
+MLGW_BNS_MODEL_VARIABLE = "BILBY_XG_MLGW_BNS_MODEL"
+
+_MLGW_BNS_MODELS = {}
 
 
-def _mlgw_bns_model():
-    """The pretrained mlgw_bns surrogate, loaded once per process.
+def mlgw_bns_model_name(name=None):
+    """``name``, else :data:`MLGW_BNS_MODEL_VARIABLE`'s value, else
+    ``"default_hom"``, as the shipped model's canonical name."""
+    from mlgw_bns.model_files import canonical_name
 
-    Its stored parameter ranges reject lambda < 5 (a guard for TEOBResumS
-    during training); the surrogate itself is fine down to 0, which a flat
-    tidal prior reaches, so that bound is relaxed.
+    return canonical_name(name or os.environ.get(MLGW_BNS_MODEL_VARIABLE) or "default_hom")
+
+
+def _mlgw_bns_model(name=None):
+    """The shipped mlgw_bns surrogate ``name`` (see
+    :func:`mlgw_bns_model_name`), loaded once per process.
+
+    The 2.1 models accept tidal deformabilities down to 0, which a flat
+    tidal prior reaches; for older ones, whose stored ranges stop at 5 (a
+    guard for TEOBResumS during training), that bound is relaxed.
     """
-    global _MLGW_BNS_MODEL
-    if _MLGW_BNS_MODEL is None:
+    name = mlgw_bns_model_name(name)
+    if name not in _MLGW_BNS_MODELS:
         from dataclasses import replace
 
         from mlgw_bns.model import Model
 
-        model = Model.default_for_testing()
+        model = Model.default_for_testing(name)
         ranges = model.parameter_ranges
         model.parameter_ranges = replace(
             ranges, lambda1_range=(0.0, ranges.lambda1_range[1]),
             lambda2_range=(0.0, ranges.lambda2_range[1]))
-        _MLGW_BNS_MODEL = model
-    return _MLGW_BNS_MODEL
+        missing = set(MLGW_BNS_MODES) - {(mode.l, mode.m) for mode in model.modes}
+        if missing:
+            raise ValueError(f"{name} lacks the modes {sorted(missing)} of MLGW_BNS_MODES")
+        _MLGW_BNS_MODELS[name] = model
+    return _MLGW_BNS_MODELS[name]
 
 
 def convert_to_mlgw_bns_parameters(parameters):
@@ -1894,7 +1914,8 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
     ``frequency_bin_edges`` waveform argument when given (so it serves both the
     full-grid and the relative-binning likelihoods, and chunked injections),
     otherwise on ``frequency_array``. ``mode_array`` selects a subset of
-    :data:`MLGW_BNS_MODES`. Non-positive frequencies are zero.
+    :data:`MLGW_BNS_MODES`, ``mlgw_bns_model`` the shipped model (see
+    :func:`mlgw_bns_model_name`). Non-positive frequencies are zero.
 
     The surrogate is referenced to the merger (mlgw_bns after 1.0): the
     merger is at the reference time (``geocent_time``), and
@@ -1918,7 +1939,7 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
                          f"available: {MLGW_BNS_MODES}")
 
     intrinsic = [max(q, 1.0 / q), LambdaAl2, LambdaBl2, chi1z, chi2z]  # q = m1 / m2 >= 1
-    amp, phase, times = _mlgw_bns_model().predict_modes_amp_phase(
+    amp, phase, times = _mlgw_bns_model(kwargs.get("mlgw_bns_model")).predict_modes_amp_phase(
         intrinsic, M, freqs, modes=modes, distance_mpc=distance, return_tf=True)
     if not np.all(np.isfinite(amp)):
         raise ValueError("Parameters outside the range of the mlgw_bns surrogate")
@@ -1960,29 +1981,32 @@ def _check_mlgw_bns_modes(mode_array):
     return modes
 
 
-def mlgw_bns_precessing_components(mode_array=None, n_steps=MLGW_BNS_PRECESSION_STEPS):
+def mlgw_bns_precessing_components(mode_array=None, n_steps=MLGW_BNS_PRECESSION_STEPS,
+                                   model=None):
     """The jitted :func:`mlgw_bns.batched_precession.precessing_mode_components`
-    of the pretrained surrogate, compiled once per process for each
-    ``(mode_array, n_steps)`` (and input shape)."""
+    of the shipped surrogate ``model`` (:func:`mlgw_bns_model_name`), compiled
+    once per process for each ``(model, mode_array, n_steps)`` (and input
+    shape)."""
     import jax
     from mlgw_bns.batched_precession import precessing_mode_components
 
     modes = tuple(_check_mlgw_bns_modes(MLGW_BNS_MODES if mode_array is None else mode_array))
-    key = (modes, int(n_steps))
+    key = (mlgw_bns_model_name(model), modes, int(n_steps))
     if key not in _MLGW_BNS_PRECESSING:
         _MLGW_BNS_PRECESSING[key] = jax.jit(
-            precessing_mode_components(_mlgw_bns_model(), modes, int(n_steps)))
+            precessing_mode_components(_mlgw_bns_model(model), modes, int(n_steps)))
     return _MLGW_BNS_PRECESSING[key]
 
 
-def _mlgw_bns_precession_angles(n_steps):
+def _mlgw_bns_precession_angles(n_steps, model=None):
     """The jitted :func:`mlgw_bns.batched_precession.precession_angles`."""
     import jax
     from mlgw_bns.batched_precession import precession_angles
 
-    key = ("angles", int(n_steps))
+    key = (mlgw_bns_model_name(model), "angles", int(n_steps))
     if key not in _MLGW_BNS_PRECESSING:
-        _MLGW_BNS_PRECESSING[key] = jax.jit(precession_angles(_mlgw_bns_model(), int(n_steps)))
+        _MLGW_BNS_PRECESSING[key] = jax.jit(
+            precession_angles(_mlgw_bns_model(model), int(n_steps)))
     return _MLGW_BNS_PRECESSING[key]
 
 
@@ -2050,7 +2074,8 @@ def mlgw_bns_precessing_individual_modes(frequency_array, M, q, a_1, a_2, tilt_1
     (where the precession angles are integrated from; see
     :func:`mlgw_bns_precessing_start_frequency`). Other waveform arguments:
     ``mode_array``, ``precession_n_steps`` (default
-    :data:`MLGW_BNS_PRECESSION_STEPS`) and ``return_twist``: if true each
+    :data:`MLGW_BNS_PRECESSION_STEPS`), ``mlgw_bns_model`` (the shipped
+    model, :func:`mlgw_bns_model_name`) and ``return_twist``: if true each
     mode also has ``"coprecessing"``, ``"c_plus"`` and ``"c_cross"``, with
     ``plus = c_plus * coprecessing`` and ``cross = c_cross * coprecessing``.
     """
@@ -2062,13 +2087,14 @@ def mlgw_bns_precessing_individual_modes(frequency_array, M, q, a_1, a_2, tilt_1
     reference_frequency = float(kwargs.get("reference_frequency", 50.0))
     start = mlgw_bns_precessing_start_frequency(freqs, kwargs.get("minimum_frequency"))
     in_band = freqs >= start
+    model = mlgw_bns_model_name(kwargs.get("mlgw_bns_model"))
 
     q = max(q, 1.0 / q)  # m1 / m2 >= 1
     arguments = (M, q, a_1, a_2, tilt_1, tilt_2, phi_12, phi_jl, LambdaAl2, LambdaBl2,
-                 distance, theta_jn, phase, reference_frequency, start, n_steps)
+                 distance, theta_jn, phase, reference_frequency, start, n_steps, model)
     # the same binary at the same frequencies, mode by mode (the fiducial
     # waveform is evaluated that way): reuse the precession angles
-    cache_key = (tuple(float(x) for x in arguments), len(freqs), hash(freqs.tobytes()))
+    cache_key = (arguments, len(freqs), hash(freqs.tobytes()))
     if _MLGW_BNS_PRECESSING_LAST.get("key") != cache_key:
         orientation = lvk_to_precessing(
             theta_jn, phi_jl, tilt_1, tilt_2, phi_12, a_1, a_2, M * q / (1 + q), M / (1 + q),
@@ -2080,10 +2106,10 @@ def mlgw_bns_precessing_individual_modes(frequency_array, M, q, a_1, a_2, tilt_1
         if angles_key not in _MLGW_BNS_ANGLES:
             if len(_MLGW_BNS_ANGLES) >= _MLGW_BNS_ANGLES_SIZE:
                 _MLGW_BNS_ANGLES.pop(next(iter(_MLGW_BNS_ANGLES)))
-            _MLGW_BNS_ANGLES[angles_key] = _mlgw_bns_precession_angles(n_steps)(
+            _MLGW_BNS_ANGLES[angles_key] = _mlgw_bns_precession_angles(n_steps, model)(
                 intrinsic, M, reference_frequency, start)
         components = _evaluate_precessing(
-            mlgw_bns_precessing_components(MLGW_BNS_MODES, n_steps), freqs[in_band], start,
+            mlgw_bns_precessing_components(MLGW_BNS_MODES, n_steps, model), freqs[in_band], start,
             intrinsic, M, distance, orientation.inclination, orientation.azimuth,
             orientation.reference_phase, reference_frequency,
             angles=_MLGW_BNS_ANGLES[angles_key])
