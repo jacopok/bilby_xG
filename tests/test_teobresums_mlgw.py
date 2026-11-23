@@ -69,13 +69,34 @@ def test_aligned_on_the_data_grid():
                                    rtol=1e-8, atol=1e-8 * np.max(abs(teob[mode]["plus"])))
 
 
-def test_precessing_matches_the_surrogate():
-    parameters = COMMON | dict(a_1=0.05, a_2=0.0014, tilt_1=np.pi / 2, tilt_2=0.0,
+#: the other teob_injections binaries (source frame m1, m2, Lambda1, Lambda2
+#: on SLy) with their models; from a 1.36 Hz start, TEOB's spin evolution
+#: used to stop after one step below ~2 Hz at these masses (fork 163eabfe)
+LOW_MASS = {
+    4000: (1.1022, 0.9588, 1375.5, 3000.0),
+    8000: (0.9676, 0.8417, 2854.6, 6000.0),
+    12000: (0.8944, 0.778, 4358.5, 9000.0),
+}
+
+
+@pytest.mark.parametrize("model", [2000, *LOW_MASS])
+def test_precessing_matches_the_surrogate(model):
+    common = COMMON
+    if model in LOW_MASS:
+        m1, m2, l1, l2 = LOW_MASS[model]
+        # detector frame at 40 Mpc
+        common = dict(M=(m1 + m2) * 1.00905, q=m2 / m1, LambdaAl2=l1, LambdaBl2=l2,
+                      distance=40.0)
+    parameters = common | dict(a_1=0.05, a_2=0.0014, tilt_1=np.pi / 2, tilt_2=0.0,
                                phi_12=0.0, phi_jl=0.0, theta_jn=0.3491, phase=1.57)
-    args = ARGS | dict(reference_frequency=20.0)
+    args = ARGS | dict(reference_frequency=20.0,
+                       mlgw_bns_model=f"default_hom_lambda{model}")
     teob = teobresums_mlgw_precessing_individual_modes(FREQS, **parameters, **args)
     mlgw = mlgw_bns_precessing_individual_modes(FREQS, **parameters, **args)
     assert sorted(teob) == sorted(mlgw)
+    # 2e-7, 1.4e-8, 1.3e-7, 1.3e-6: the 12000 model is ~7x less accurate
+    # than 8000 aligned too (1.8e-7 against 2.7e-8)
+    tolerance = 3e-6 if model == 12000 else 1e-6
     for key in ("plus", "cross"):
-        assert mismatch(total(teob, key), total(mlgw, key)) < 1e-6
+        assert mismatch(total(teob, key), total(mlgw, key)) < tolerance
     assert np.all(teob["2,2"]["time_to_merger"][FREQS < 1000] > 0)
