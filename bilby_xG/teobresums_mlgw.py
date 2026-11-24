@@ -60,6 +60,10 @@ TEOBRESUMS_SPA_F0_SAFETY = 0.05
 #: the ODE starts this factor below the frequency where the highest-m mode
 #: reaches ``minimum_frequency``
 START_SAFETY = 1.1
+#: aligned spins: the largest relative squared difference, at a test turn,
+#: between the joint call and the single-mode calls times their phases
+#: before the fit falls back to calling TEOBResumS at every turn
+ALIGNED_TOLERANCE = 1e-8
 #: grid of the fit of the turn about L (Hz)
 FIT_BAND = (25.0, 2000.0)
 FIT_POINTS = 4000
@@ -305,14 +309,46 @@ class TEOBResumSRun:
             out[(ell, emm)] = (hp[at] * shift, hc[at] * shift, time)
         return out
 
+    def _aligned_polarisations(self, grid):
+        """For spins along L, ``delta -> (hp, hc)`` at ``delta`` without new
+        TEOBResumS calls, or None: turning about L then only moves the
+        azimuth, so each mode is its own call at 0 times exp(i s m delta),
+        and the merger time does not change. The sign s, and that the
+        single-mode calls sum to the joint one, from one direct call."""
+        if np.any(np.asarray(self.start.chi_1)[:2]) or np.any(np.asarray(self.start.chi_2)[:2]):
+            return None
+        from mlgw_bns.higher_order_modes import mode_to_k
+        shift = np.exp(-2j * np.pi * self.merger_time(0.0) * grid)
+        parts = []
+        for mode in self.model.modes:
+            hp, hc, _, _ = self.run(grid, [mode_to_k(mode)], 0.0)
+            parts.append((mode.m, hp * shift, hc * shift))
+
+        def polarisations(delta, sign):
+            turn = [np.exp(1j * sign * m * delta) for m, _, _ in parts]
+            return (sum(t * hp for t, (_, hp, _) in zip(turn, parts)),
+                    sum(t * hc for t, (_, _, hc) in zip(turn, parts)))
+        probe = 0.5
+        hp_d, hc_d = self.polarisations(grid, probe)
+        scale = np.sum(abs(hp_d) ** 2 + abs(hc_d) ** 2)
+        miss = {sign: np.sum(abs(polarisations(probe, sign)[0] - hp_d) ** 2
+                             + abs(polarisations(probe, sign)[1] - hc_d) ** 2) / scale for sign in (1, -1)}
+        sign = min(miss, key=miss.get)
+        if miss[sign] > ALIGNED_TOLERANCE:
+            return None
+        return lambda delta: polarisations(delta, sign)
+
     def _fit_delta(self, target):
         grid = np.geomspace(*FIT_BAND, FIT_POINTS)
         weight = np.gradient(grid) / grid ** (7 / 3)
         hp_m, hc_m = target(grid)
         norm_m = np.sum((abs(hp_m) ** 2 + abs(hc_m) ** 2) * weight)
+        # aligned spins: the turn is a phase per mode (9 calls instead of ~90)
+        fast = self._aligned_polarisations(grid)
+        polarisations = fast if fast is not None else (lambda delta: self.polarisations(grid, delta))
 
         def overlap(delta):
-            hp, hc = self.polarisations(grid, delta)
+            hp, hc = polarisations(delta)
             norm = np.sqrt(np.sum((abs(hp) ** 2 + abs(hc) ** 2) * weight) * norm_m)
             return float(np.sum((np.conj(hp) * hp_m + np.conj(hc) * hc_m) * weight).real / norm)
 
