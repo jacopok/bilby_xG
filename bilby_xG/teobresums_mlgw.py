@@ -46,8 +46,14 @@ from .source import (MLGW_BNS_MODES, _check_mlgw_bns_modes, _mlgw_bns_model,
 
 __author__ = ["Jacopo Tissino"]
 
-#: G Msun / c^3 (s)
-SUN_SECONDS = 4.925490947641267e-06
+try:
+    from mlgw_bns.constants import SUN_MASS_SECONDS as SUN_SECONDS, TEOBRESUMS_MASS_FACTOR
+except ImportError:  # mlgw_bns before its constants module: the same values
+    #: G Msun / c^3 (s), IAU 2015 nominal (= LAL MTSUN_SI, bilby)
+    SUN_SECONDS = 4.925490947641267e-06
+    #: a mass to TEOBResumS in physical units, times this: its MSUN_S
+    #: (4.925491025543576e-6, TEOBResumS.h) is 1.6e-8 above the IAU value
+    TEOBRESUMS_MASS_FACTOR = SUN_SECONDS / 4.925491025543575903411922162094833998e-6
 #: TEOBResumS' frequency-domain evolution starts this fraction below its band
 #: (SPA_F0_SAFETY in TEOBResumS.h), where it imposes the spins
 TEOBRESUMS_SPA_F0_SAFETY = 0.05
@@ -189,7 +195,8 @@ class TEOBResumSRun:
         largest_l = max(mode.l for mode in self.model.modes)
         dataset = self.model.dataset
         _, hp_re, hp_im, hc_re, hc_im, hflm, _, dyn = eobrun(dict(
-            M=P.total_mass, q=P.mass_ratio, LambdaAl2=P.lambda_1, LambdaBl2=P.lambda_2,
+            # M: TEOBResumS' MSUN_S -> IAU
+            M=P.total_mass * TEOBRESUMS_MASS_FACTOR, q=P.mass_ratio, LambdaAl2=P.lambda_1, LambdaBl2=P.lambda_2,
             chi1x=P.chi_1[0], chi1y=P.chi_1[1], chi1z=P.chi_1[2],
             chi2x=P.chi_2[0], chi2y=P.chi_2[1], chi2z=P.chi_2[2],
             distance=P.distance_mpc, inclination=P.inclination,

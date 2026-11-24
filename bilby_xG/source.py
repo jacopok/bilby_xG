@@ -2173,6 +2173,17 @@ TEOBRESUMS_AMP_SI_BASE = 4.2425873413901263e24
 TEOBRESUMS_F_START_SAFETY_FACTOR = 1.1
 
 
+def _teobresums_mass_factor():
+    """A total mass passed to TEOBResumS in physical units, times this: its
+    MSUN_S (TEOBResumS.h) is 1.6e-8 above the IAU 2015 G Msun / c^3 that
+    bilby, LAL and mlgw_bns use."""
+    try:
+        from mlgw_bns.constants import TEOBRESUMS_MASS_FACTOR
+        return TEOBRESUMS_MASS_FACTOR
+    except ImportError:
+        return 4.925490947641267e-06 / 4.925491025543575903411922162094833998e-6
+
+
 def _wigner_d(ell, emm, s, iota):
     """Wigner d-function d^l_{m,s}(iota), eq. (II.8) of arXiv:0709.0093."""
     from math import cos, factorial, sin, sqrt
@@ -2272,7 +2283,8 @@ def teobresums_spa_individual_modes(frequency_array, M, q, chi1z, chi2z,
                          / TEOBRESUMS_F_START_SAFETY_FACTOR)
     srate = waveform_kwargs["maximum_frequency"] * 2
     f, _, _, _, _, hflm, _, dyn = EOBRun_module.EOBRunPy({
-        "M": M, "q": q, "chi1": chi1z, "chi2": chi2z, "chi1z": chi1z,
+        # M: TEOBResumS' MSUN_S -> IAU
+        "M": M * _teobresums_mass_factor(), "q": q, "chi1": chi1z, "chi2": chi2z, "chi1z": chi1z,
         "chi2z": chi2z, "LambdaAl2": LambdaAl2, "LambdaBl2": LambdaBl2,
         "distance": distance, "inclination": inclination,
         "coalescence_angle": coalescence_angle, "srate": srate,
