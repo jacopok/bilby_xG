@@ -234,22 +234,26 @@ def _assert_same_summary_data(a, b):
     assert a.noise_log_likelihood() == b.noise_log_likelihood()
 
 
-@pytest.mark.parametrize("saves", [3, 7])  # in the first detector; in a later one
-def test_summary_data_resume_from_a_checkpoint(tmp_path, monkeypatch, saves):
+@pytest.mark.parametrize("when", ["middle", "last"])  # mid-pieces; all done
+def test_summary_data_resume_from_a_checkpoint(tmp_path, monkeypatch, when):
     """A computation stopped after some checkpoints and started again gives
     the same summary data as one that ran through, and removes its file."""
     path = str(tmp_path / "summary_data.pkl")
-    reference = _likelihood(seed=5, chunk_size=1000)
     save = Likelihood._save_summary_data_checkpoint
-    count = dict(n=0)
+    count = dict(n=0, stop=None)
 
-    def interrupted_save(self, state):
+    def counting_save(self, state):
         save(self, state)
         count["n"] += 1
-        if count["n"] == saves:
+        if count["n"] == count["stop"]:
             raise _Interrupted
 
-    monkeypatch.setattr(Likelihood, "_save_summary_data_checkpoint", interrupted_save)
+    monkeypatch.setattr(Likelihood, "_save_summary_data_checkpoint", counting_save)
+    reference = _likelihood(seed=5, chunk_size=1000, summary_data_checkpoint=path,
+                            summary_data_checkpoint_interval=0)
+    assert not os.path.exists(path)
+    saves, count["n"] = count["n"], 0
+    count["stop"] = saves // 2 if when == "middle" else saves
     with pytest.raises(_Interrupted):
         _likelihood(seed=5, chunk_size=1000, summary_data_checkpoint=path,
                     summary_data_checkpoint_interval=0)
@@ -259,6 +263,7 @@ def test_summary_data_resume_from_a_checkpoint(tmp_path, monkeypatch, saves):
     assert state["done"] or state["current"]["next_piece"] > 0
     resumed = _likelihood(seed=5, chunk_size=1000, summary_data_checkpoint=path)
     _assert_same_summary_data(reference, resumed)
+    _assert_same_summary_data(_likelihood(seed=5, chunk_size=1000), resumed)
     assert not os.path.exists(path)
 
 
@@ -277,3 +282,84 @@ def test_summary_data_checkpoint_of_other_data_is_ignored(tmp_path, monkeypatch)
     monkeypatch.setattr(Likelihood, "_save_summary_data_checkpoint", save)
     other = _likelihood(seed=6, chunk_size=1000, summary_data_checkpoint=path)
     _assert_same_summary_data(_likelihood(seed=6, chunk_size=1000), other)
+
+
+@pytest.mark.parametrize("scan", [2 ** 14, 64])  # the whole (test) grid; a coarse one
+@pytest.mark.parametrize("total_mass", [65.0, 180.0, 400.0])  # cut-off above, in, below the band
+def test_fiducial_cutoff_as_the_full_grid_scan(total_mass, scan, monkeypatch):
+    """The bracketed scan for the fiducial's last non-zero sample finds the
+    one a walk of the whole grid does."""
+    import bilby_xG.likelihood
+    from bilby_xG.grid import FrequencyGrid
+    likelihood = _likelihood(noise=False)
+    monkeypatch.setattr(bilby_xG.likelihood, "FIDUCIAL_CUTOFF_SCAN", scan)
+    converted = dict(likelihood._fiducial_converted_parameters)
+    scale = total_mass / (converted["mass_1"] + converted["mass_2"])
+    for key in ("mass_1", "mass_2"):
+        converted[key] *= scale
+    converted.update(bilby.gw.conversion.generate_mass_parameters(
+        dict(mass_1=converted["mass_1"], mass_2=converted["mass_2"])))
+    grid = FrequencyGrid.of(likelihood.waveform_generator)
+    first = int(grid.searchsorted(FMIN - grid.step, side="right"))
+    maxima = []
+    for ell, emm in likelihood.mode_array:
+        frequencies = grid.frequencies(first, grid.size)
+        plus = likelihood._fiducial_mode_polarizations(
+            converted, f"{ell},{emm}", frequencies)["plus"]
+        if np.any(plus):
+            maxima.append(frequencies[np.flatnonzero(plus)[-1]])
+    expected = min(maxima) if maxima else FMAX
+    assert likelihood._fiducial_maximum_frequency(converted) == expected
+
+
+@pytest.mark.parametrize("times", ["source", "newtonian"])
+def test_quadrature_summary_data_match_the_sums(times, monkeypatch):
+    """summary_data_quadrature: a BNS inspiral's summary data by quadrature
+    in its wide bins give the log-likelihood ratio and <s|s> of the sums
+    over the grid (zero noise), from fewer evaluations; with the source's
+    times to merger, or (a source without them) the 0PN ones."""
+    pytest.importorskip("mlgw_bns")
+    if times == "newtonian":
+        import bilby_xG.likelihood
+        monkeypatch.setattr(bilby_xG.likelihood, "TIME_TO_MERGER_KEY", "no such key")
+    from test_bounded_memory import FMAX as BNS_FMAX, FMIN as BNS_FMIN, INJECTION as BNS, TC
+    from test_bounded_memory import _waveform_generator as bns_waveform_generator
+
+    modes = [[2, 2], [2, 1], [3, 3], [4, 4]]
+    duration = 256
+
+    def likelihood(quadrature):
+        wfg = bns_waveform_generator(duration)
+        wfg.waveform_arguments["mode_array"] = modes
+        ifos = InterferometerList(["ET-EMR"])
+        injection = SummaryDataInjection(wfg, BNS, TC + 2 - duration, BNS_FMIN, BNS_FMAX,
+                                         noise=False)
+        injection.setup_interferometers(ifos)
+        return Likelihood(
+            interferometers=ifos, waveform_generator=wfg, fiducial_parameters=BNS,
+            epsilon=0.1, time_reference="geocent", mode_array=modes, injection=injection,
+            summary_data_quadrature=quadrature)
+
+    sums, quadrature = likelihood(False), likelihood(True)
+    d = quadrature._summary_data_detector(quadrature.interferometers[0])
+    assert any(piece[0] == "quadrature" for piece in d.pieces)
+    np.testing.assert_allclose(quadrature.noise_log_likelihood(),
+                               sums.noise_log_likelihood(), rtol=1e-9)
+    rng = np.random.default_rng(1)
+    for k in range(4):
+        parameters = dict(BNS)
+        if k:
+            parameters.update(chirp_mass=BNS["chirp_mass"] * (1 + 2e-6 * rng.normal()),
+                              mass_ratio=BNS["mass_ratio"] + 0.01 * rng.normal(),
+                              phase=BNS["phase"] + 0.3 * rng.normal(),
+                              lambda_1=BNS["lambda_1"] + 100 * rng.normal())
+        np.testing.assert_allclose(_log_likelihood_ratio(quadrature, parameters),
+                                   _log_likelihood_ratio(sums, parameters), rtol=0, atol=1e-4)
+
+
+def test_quadrature_needs_an_injection():
+    ifos, wfg = InterferometerList(["ET-EMR"]), _waveform_generator()
+    inject_zero_noise_chunked(ifos, wfg, INJECTION, START_TIME, FMIN, FMAX, progress=False)
+    with pytest.raises(ValueError, match="summary_data_quadrature"):
+        Likelihood(interferometers=ifos, waveform_generator=wfg, fiducial_parameters=INJECTION,
+                   epsilon=0.05, time_reference="geocent", summary_data_quadrature=True)

@@ -33,6 +33,8 @@ import os
 import pickle
 import tempfile
 import time
+from functools import lru_cache
+from types import SimpleNamespace
 
 import numpy as np
 from scipy.optimize import differential_evolution
@@ -53,6 +55,74 @@ from .waveform_generator import source_frequency_array
 from .interferometer import TIME_TO_MERGER_KEY
 from .injection import complex_gaussian
 from .motion import resolve_center
+
+# samples of the coarse scan for the fiducial's cut-off (_fiducial_maximum_frequency)
+FIDUCIAL_CUTOFF_SCAN = 2 ** 14
+# summary_data_quadrature: Gauss-Legendre nodes per radian of the integrands'
+# largest phase span in a bin (about 1/2 resolves it), at least the minimum;
+# a bin is integrated so only with this many times fewer nodes than samples
+QUADRATURE_NODES_PER_RADIAN = 1.0
+QUADRATURE_MIN_NODES = 48
+QUADRATURE_MIN_GAIN = 4
+# the spread of the modes' times to merger over a bin, times the safety, plus
+# the margin (s): the signal's differs from the fiducial's
+QUADRATURE_TIME_SAFETY = 1.25
+QUADRATURE_TIME_MARGIN = 0.5
+
+
+QUADRATURE_MIN_PIECE_NODES = 8
+QUADRATURE_ORDER = 64
+#: G Msun / c^3 (s)
+_SUN_SECONDS = 4.925490947641267e-06
+
+
+def _chirp_mass(parameters):
+    """The (detector-frame) chirp mass of converted parameters (Msun)."""
+    if "chirp_mass" in parameters:
+        return float(parameters["chirp_mass"])
+    m1, m2 = float(parameters["mass_1"]), float(parameters["mass_2"])
+    return (m1 * m2) ** 0.6 / (m1 + m2) ** 0.2
+
+
+def _newtonian_time_to_merger(chirp_mass, frequencies):
+    """The (2,2)'s 0PN time to merger (s) at ``frequencies`` (Hz)."""
+    return 5 / 256 * (chirp_mass * _SUN_SECONDS) ** (-5 / 3) * (
+        np.pi * np.asarray(frequencies, dtype=float)) ** (-8 / 3)
+
+
+@lru_cache(maxsize=None)
+def _gauss_legendre(n):
+    return np.polynomial.legendre.leggauss(n)
+
+
+def _split_breaks(lo, hi, n, knots):
+    """The pieces of [lo, hi] for about ``n`` nodes: split at the ``knots``
+    inside it and into enough equal parts for at most
+    ``QUADRATURE_ORDER`` nodes a piece."""
+    parts = np.linspace(lo, hi, -(-n // QUADRATURE_ORDER) + 1)
+    return np.union1d(parts, knots[(knots > lo) & (knots < hi)])
+
+
+def _split_count(lo, hi, n, knots):
+    """The number of nodes of ``_split_rule(lo, hi, n, knots)``."""
+    breaks = _split_breaks(lo, hi, n, knots)
+    return int(np.sum(np.maximum(QUADRATURE_MIN_PIECE_NODES,
+                                 np.ceil(n * np.diff(breaks) / (hi - lo)))))
+
+
+def _split_rule(lo, hi, n, knots):
+    """Composite Gauss-Legendre nodes and weights on [lo, hi]: about ``n``
+    nodes, shared by length between the pieces of :func:`_split_breaks`
+    (smooth, as the PSD's interpolation is between its knots), at least
+    ``QUADRATURE_MIN_PIECE_NODES`` and at most ``QUADRATURE_ORDER`` each."""
+    breaks = _split_breaks(lo, hi, n, knots)
+    x, w = [], []
+    for a, b in zip(breaks[:-1], breaks[1:]):
+        m = max(QUADRATURE_MIN_PIECE_NODES, int(np.ceil(n * (b - a) / (hi - lo))))
+        t, v = _gauss_legendre(m)
+        x.append((a + b) / 2 + (b - a) / 2 * t)
+        w.append((b - a) / 2 * v)
+    return np.concatenate(x), np.concatenate(w)
 
 # bilby >= 2.8 passes ``parameters`` explicitly through log_likelihood_ratio
 # and calculate_snrs, and warns (FutureWarning) on every read of the
@@ -881,6 +951,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                  injection=None,
                  summary_data_checkpoint=None,
                  summary_data_checkpoint_interval=600.0,
+                 summary_data_quadrature=False,
                  precessing_scheme="ratio",
                  second_order=True,
                  legacy=False):
@@ -979,6 +1050,9 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         # resumes from them: a job that runs out of time loses at most that
         self.summary_data_checkpoint = summary_data_checkpoint
         self.summary_data_checkpoint_interval = summary_data_checkpoint_interval
+        # an injection's summary data by quadrature in wide bins (an
+        # approximation of the sums over the grid; see _summary_data_plan)
+        self.summary_data_quadrature = bool(summary_data_quadrature)
         if array_cache_dir is None and injection is None:
             array_cache_dir = tempfile.mkdtemp(prefix="bilby_xG_array_cache_")
         self.array_cache_dir = array_cache_dir
@@ -1204,30 +1278,44 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
     def _fiducial_maximum_frequency(self, converted_parameters):
         """Largest frequency at which any fiducial mode is non-zero.
 
-        Evaluated in ``summary_data_chunk_size`` chunks through the
-        frequency-sequence path so no full-resolution waveform is built. This
-        reproduces the legacy full-grid ``!= 0`` criterion (both paths share the
-        waveform model's hard high-frequency cut-off) without its historical
-        off-by-``minimum_frequency`` indexing error.
+        A mode's support ends at its model's hard high-frequency cut-off, so
+        a coarse scan (``FIDUCIAL_CUTOFF_SCAN`` geometrically spaced samples
+        of the data grid, all modes) brackets its last non-zero sample
+        between two of them, and only that stretch of the grid is evaluated
+        in full (in ``summary_data_chunk_size`` chunks): the full-grid
+        ``!= 0`` criterion without walking the whole grid (2.7e8 samples for
+        a 3 Hz binary neutron star, hours of surrogate calls).
         """
         grid = FrequencyGrid.of(self.waveform_generator)
         minimum_frequency = min(ifo.minimum_frequency for ifo in self.interferometers)
         # the grid above minimum_frequency - df
         first = int(grid.searchsorted(minimum_frequency - grid.step, side="right"))
+        if first >= grid.size:
+            return min(ifo.maximum_frequency for ifo in self.interferometers)
+        coarse = np.unique(np.concatenate([[first], np.round(np.geomspace(
+            max(first, 1), grid.size - 1, FIDUCIAL_CUTOFF_SCAN)).astype(np.int64)]))
+        coarse_frequencies = grid.at(coarse)
 
         per_mode_maxima = []
         for ell, emm in self.mode_array:
             mode_key = f"{ell},{emm}"
+            plus = self._fiducial_mode_polarizations(
+                converted_parameters, mode_key, coarse_frequencies)["plus"]
+            nonzero = np.flatnonzero(plus)
+            if not len(nonzero):
+                continue
+            # the last non-zero sample is in [coarse[k], coarse[k + 1])
+            k = nonzero[-1]
+            stop = int(coarse[k + 1]) if k + 1 < len(coarse) else grid.size
             last_nonzero_frequency = None
-            for start, stop in grid.chunks(first, grid.size, self.summary_data_chunk_size):
-                chunk = grid.frequencies(start, stop)
+            for start, end in grid.chunks(int(coarse[k]), stop, self.summary_data_chunk_size):
+                chunk = grid.frequencies(start, end)
                 plus = self._fiducial_mode_polarizations(
                     converted_parameters, mode_key, chunk)["plus"]
-                nonzero = np.nonzero(plus)[0]
+                nonzero = np.flatnonzero(plus)
                 if len(nonzero):
                     last_nonzero_frequency = chunk[nonzero[-1]]
-            if last_nonzero_frequency is not None:
-                per_mode_maxima.append(last_nonzero_frequency)
+            per_mode_maxima.append(last_nonzero_frequency)
 
         if per_mode_maxima:
             return min(per_mode_maxima)
@@ -1377,12 +1465,13 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         wf[frequencies > self.maximum_frequency] = 0
         return wf
 
-    def _bin_chunks(self, masked_bin_inds):
-        """Yield ``(start_bin, end_bin)`` ranges of consecutive bins whose
-        combined frequency span stays within ``summary_data_chunk_size``
-        samples (always at least one bin per chunk)."""
-        number_of_bins = self.number_of_bins
-        start = 0
+    def _bin_chunks(self, masked_bin_inds, first=0, last=None):
+        """Yield ``(start_bin, end_bin)`` ranges of consecutive bins (of
+        bins ``[first, last)``, all by default) whose combined frequency
+        span stays within ``summary_data_chunk_size`` samples (always at
+        least one bin per chunk)."""
+        number_of_bins = self.number_of_bins if last is None else last
+        start = first
         while start < number_of_bins:
             end = start + 1
             while (end < number_of_bins and
@@ -1392,7 +1481,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
             yield start, end
             start = end
 
-    def _summary_data_pieces(self, masked_bin_inds):
+    def _summary_data_pieces(self, masked_bin_inds, first=0, last=None):
         """Yield ``(start_bin, end_bin, lo, hi)``: the bins of each
         :meth:`_bin_chunks` group and the in-band index range ``[lo, hi)``
         to evaluate them on at once, at most ``summary_data_chunk_size``
@@ -1401,7 +1490,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         the summary data add up: memory stays bounded however long the
         signal, and a bin within a chunk is computed as before."""
         size = self.summary_data_chunk_size
-        for start, end in self._bin_chunks(masked_bin_inds):
+        for start, end in self._bin_chunks(masked_bin_inds, first, last):
             lo, hi = int(masked_bin_inds[start]), int(masked_bin_inds[end])
             if end - start > 1 or hi - lo <= size:
                 yield start, end, lo, hi
@@ -1421,6 +1510,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                            else repr(v)) for k, v in d.items())
 
         parts = (
+            "checkpoint format 2", bool(getattr(self, "summary_data_quadrature", False)),
             [ifo.name for ifo in self.interferometers], [list(m) for m in self.mode_array],
             self.summary_data_chunk_size, bool(self.legacy),
             (self.earth_rotation_time_delay, self.earth_rotation_beam_patterns,
@@ -1458,7 +1548,7 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
             return fresh
         current = state["current"]
         logger.info(f"Summary data resumed from {path}: done {list(state['done']) or 'none'}"
-                    + (f", {current['name']} from piece {current['next_piece']}"
+                    + (f", {', '.join(current['names'])} from piece {current['next_piece']}"
                        if current else ""))
         return state
 
@@ -1471,13 +1561,297 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
             pickle.dump(state, f)
         os.replace(path + ".tmp", path)
 
+    def _summary_data_detector(self, interferometer):
+        """What :meth:`compute_summary_data` keeps for one interferometer:
+        its in-band grid, strain, PSD, bins by index, pieces and running
+        sums (a namespace)."""
+        injection = self.injection
+        n_modes = len(self.mode_array)
+        if injection is None:
+            interferometer.offload_frequency_domain_strain(self.array_cache_dir)
+        interferometer.discard_regenerable_frequency_caches()
+        d = SimpleNamespace(interferometer=interferometer, name=interferometer.name)
+        # the in-band frequencies, bilby's frequency_mask: without
+        # notches, the grid's [minimum_frequency, maximum_frequency]
+        # index range, walked a chunk at a time (no full-band array, so
+        # memory does not grow with the duration); with notches, the
+        # mask itself (full band)
+        grid = FrequencyGrid.of(interferometer.strain_data)
+        if interferometer.strain_data.notch_list:
+            mask = interferometer.frequency_mask
+            d.in_band_indices = np.flatnonzero(mask)
+            masked_frequency_array = grid.at(d.in_band_indices)
+            d.raw_offset = None
+
+            def in_band(lo, hi):
+                return masked_frequency_array[lo:hi]
+
+            d.masked_bin_inds = np.searchsorted(masked_frequency_array, self.bin_freqs)
+            # its own pieces: not shared with other interferometers
+            d.group_key = ("notches", interferometer.name)
+        else:
+            d.raw_offset, _ = grid.band(interferometer.minimum_frequency,
+                                        interferometer.maximum_frequency)
+            d.in_band_indices = None
+
+            def in_band(lo, hi):
+                return grid.frequencies(d.raw_offset + lo, d.raw_offset + hi)
+
+            d.masked_bin_inds = grid.searchsorted(self.bin_freqs) - d.raw_offset
+            psd_table = getattr(interferometer.power_spectral_density, "frequency_array", None)
+            # (the quadrature's nodes depend on the PSD's table too)
+            d.group_key = (int(d.raw_offset), d.masked_bin_inds.tobytes(),
+                           None if psd_table is None else np.asarray(psd_table).tobytes())
+        d.in_band = in_band
+        d.duration = interferometer.duration
+        d.raw_strain = (None if injection is not None
+                        else interferometer.strain_data._frequency_domain_strain)
+        d.psd_model = interferometer.power_spectral_density
+        d.window_power_correction = interferometer._window_power_correction
+        d.s_inner_s, d.s_inner_n = 0.0, 0j
+        d.z = None
+        if injection is not None and injection.noise:
+            # standard circular complex normals, one per basis function
+            # (h0_k, h0_k (f - f_m) for every mode k, and the signal) per
+            # bin, drawn up front so the realisation does not depend on
+            # the chunking
+            rng = injection.noise_generator(interferometer)
+            d.z = (rng.standard_normal((self.number_of_bins, 2 * n_modes + 1))
+                   + 1j * rng.standard_normal((self.number_of_bins, 2 * n_modes + 1))
+                   ) / np.sqrt(2)
+        d.a0, d.b0, d.a1, d.b1, d.b2 = dict(), dict(), dict(), dict(), dict()
+        for j, (ell, emm) in enumerate(self.mode_array):
+            key = f'{ell},{emm}'
+            d.b0[key], d.b1[key], d.b2[key] = dict(), dict(), dict()
+            d.a0[key], d.a1[key] = np.zeros((2, self.number_of_bins), dtype=complex)
+            for ellp, emmp in self.mode_array[j::]:
+                (d.b0[key][f'{ellp},{emmp}'], d.b1[key][f'{ellp},{emmp}'],
+                 d.b2[key][f'{ellp},{emmp}']) = np.zeros((3, self.number_of_bins), dtype=complex)
+        d.gram = dict()
+        d.pieces = self._summary_data_plan(d, grid)
+        return d
+
+    _SUMS = ("a0", "a1", "b0", "b1", "b2", "s_inner_s", "s_inner_n", "gram")
+
+    def _summary_data_plan(self, d, grid):
+        """The pieces the summary data of ``d`` are computed in, in bin
+        order: ``("exact", start_bin, end_bin, lo, hi)``, the in-band
+        samples ``[lo, hi)`` (:meth:`_summary_data_pieces`), and, with
+        ``summary_data_quadrature``, ``("quadrature", start_bin, end_bin,
+        frequencies, weights, offsets)``: bins integrated with Gauss-Legendre
+        nodes (bin k's are ``offsets[k]:offsets[k + 1]``) where that takes
+        far fewer evaluations than their samples."""
+        inds = d.masked_bin_inds
+        if not getattr(self, "summary_data_quadrature", False):
+            return [("exact",) + piece for piece in self._summary_data_pieces(inds)]
+        edges = grid.at(d.raw_offset + inds)
+        half = 0.5 / d.duration
+        # the PSD is interpolated between the points of its table: its kinks
+        # there would slow the quadrature's convergence, so a bin's rule is
+        # split at them (smooth pieces)
+        table = getattr(d.psd_model, "frequency_array", None)
+        knots = np.empty(0) if table is None else np.asarray(table, dtype=float)
+        wanted = self._quadrature_nodes(inds, d.duration)
+        samples = np.diff(inds)
+        # (counted first: a rule is only built where it is used)
+        nodes = np.array([
+            _split_count(edges[i] - half, edges[i + 1] - half, int(wanted[i]), knots)
+            if wanted[i] * QUADRATURE_MIN_GAIN <= samples[i] else samples[i]
+            for i in range(self.number_of_bins)])
+        quadrature = nodes * QUADRATURE_MIN_GAIN <= samples
+        rules = {i: _split_rule(edges[i] - half, edges[i + 1] - half, int(wanted[i]), knots)
+                 for i in np.flatnonzero(quadrature)}
+        pieces, start = [], 0
+        while start < self.number_of_bins:
+            end = start + 1
+            while end < self.number_of_bins and quadrature[end] == quadrature[start]:
+                end += 1
+            if not quadrature[start]:
+                pieces += [("exact",) + piece for piece in self._summary_data_pieces(
+                    inds, start, end)]
+            else:
+                bin_start = start
+                while bin_start < end:
+                    bin_end, total = bin_start, 0
+                    while bin_end < end and (bin_end == bin_start or total + nodes[bin_end]
+                                             <= self.summary_data_chunk_size):
+                        total += nodes[bin_end]
+                        bin_end += 1
+                    frequencies, weights, offsets = [], [], [0]
+                    for i in range(bin_start, bin_end):
+                        # the samples of bin i are those of [f_lo, f_hi) on
+                        # the grid: their sum is duration x the integral over
+                        # [f_lo - df / 2, f_hi - df / 2] (midpoint rule)
+                        x, w = rules[i]
+                        frequencies.append(x)
+                        weights.append(w * d.duration)
+                        offsets.append(offsets[-1] + len(x))
+                    pieces.append(("quadrature", bin_start, bin_end, np.concatenate(frequencies),
+                                   np.concatenate(weights), offsets))
+                    bin_start = bin_end
+            start = end
+        n_exact = int(np.sum(samples[~quadrature]))
+        n_nodes = int(np.sum(nodes[quadrature]))
+        logger.info(f"{d.name}: summary data by quadrature in {int(quadrature.sum())} of "
+                    f"{self.number_of_bins} bins ({n_nodes:.3g} nodes for "
+                    f"{int(np.sum(samples[quadrature])):.3g} samples), {n_exact:.3g} samples "
+                    "summed exactly")
+        return pieces
+
+    def _quadrature_nodes(self, masked_bin_inds, duration):
+        """Gauss-Legendre nodes per bin for the summary data's integrands:
+        products of the fiducial modes (and the signal), whose phases differ
+        by at most 2 pi dt per Hz, dt the spread of the modes' times to
+        merger over the bin; ``QUADRATURE_NODES_PER_RADIAN`` per radian of
+        that, at least ``QUADRATURE_MIN_NODES``."""
+        frequencies = np.asarray(self.bin_freqs, dtype=float)
+        converted = self._fiducial_converted_parameters
+        times = []
+        for ell, emm in self.mode_array:
+            mode = self._fiducial_mode_polarizations(converted, f"{ell},{emm}", frequencies)
+            if TIME_TO_MERGER_KEY in mode:
+                times.append(np.asarray(mode[TIME_TO_MERGER_KEY], dtype=float))
+            else:  # the 0PN time of the mode's (2,2) frequency, 2 f / m
+                times.append(_newtonian_time_to_merger(
+                    _chirp_mass(converted), 2 * frequencies / abs(emm)))
+        times = np.array(times)
+        # over the modes and both edges of each bin
+        latest = np.maximum(times[:, :-1], times[:, 1:]).max(axis=0)
+        earliest = np.minimum(times[:, :-1], times[:, 1:]).min(axis=0)
+        spread = QUADRATURE_TIME_SAFETY * (latest - earliest) + QUADRATURE_TIME_MARGIN
+        width = np.diff(frequencies)
+        nodes = np.ceil(QUADRATURE_NODES_PER_RADIAN * 2 * np.pi * spread * width)
+        return (nodes + QUADRATURE_MIN_NODES).astype(np.int64)
+
+    def _summary_data_piece(self, d, piece):
+        """Add one piece's contributions to the summary data of ``d``."""
+        injection = self.injection
+        n_modes = len(self.mode_array)
+        kind, chunk_start, chunk_end = piece[:3]
+        inds = d.masked_bin_inds
+        if kind == "exact":
+            chunk_lo, chunk_hi = piece[3:]
+            chunk_frequencies = d.in_band(chunk_lo, chunk_hi)
+            weights = None
+            # the part of bin i in this piece (all of it, unless the bin is
+            # wider than a chunk and split into pieces)
+            bins = [(i, slice(max(inds[i], chunk_lo) - chunk_lo,
+                              min(inds[i + 1], chunk_hi) - chunk_lo), inds[i + 1] <= chunk_hi)
+                    for i in range(chunk_start, chunk_end)]
+        else:
+            chunk_frequencies, weights, offsets = piece[3:]
+            bins = [(i, slice(offsets[k], offsets[k + 1]), True)
+                    for k, i in enumerate(range(chunk_start, chunk_end))]
+        chunk_psd = (d.psd_model.get_power_spectral_density_array(chunk_frequencies)
+                     * d.window_power_correction)
+        if weights is not None:
+            # sum w g / S over the nodes: the inner products with S / w
+            chunk_psd = chunk_psd / weights
+        chunk_h0 = {
+            f'{ell},{emm}': self._reference_mode(
+                d.interferometer, f'{ell},{emm}', chunk_frequencies)
+            for ell, emm in self.mode_array
+        }
+        if d.raw_strain is None and self.legacy:
+            # the fork's injection: its fiducial modes with |m| of
+            # 2, 3 or 4 (the bins end below the fiducial's zeroing)
+            chunk_strain = sum(chunk_h0[f'{ell},{emm}'] for ell, emm in self.mode_array
+                               if abs(emm) in LEGACY_INJECTION_M)
+        elif d.raw_strain is None:
+            chunk_strain = injection.signal(d.interferometer, chunk_frequencies)
+        elif d.in_band_indices is None:
+            chunk_strain = d.raw_strain[d.raw_offset + chunk_lo:d.raw_offset + chunk_hi]
+        else:
+            chunk_strain = d.raw_strain[d.in_band_indices[chunk_lo:chunk_hi]]
+
+        logger.info(
+            f"{d.name}: summary data bins "
+            f"{chunk_start}-{chunk_end}/{self.number_of_bins} "
+            f"({chunk_end / self.number_of_bins:.0%}), "
+            f"frequencies [{chunk_frequencies[0]:.3g}, "
+            f"{chunk_frequencies[-1]:.3g}] Hz"
+            + (f", {len(chunk_frequencies)} quadrature nodes." if weights is not None else "."))
+
+        duration = d.duration
+        a0, a1, b0, b1, b2 = d.a0, d.a1, d.b0, d.b1, d.b2
+        for i, idxs, bin_complete in bins:
+            frequencies = chunk_frequencies[idxs]
+            # the centre the ratios' r0 refer to (the midpoint of the
+            # bin edges), not that of the samples in the bin: they
+            # differ by up to a sample spacing, an error of r1 times
+            # it which more bins do not reduce (legacy: the fork's,
+            # the samples' midpoint)
+            if self.legacy:
+                bin_lo, bin_hi = inds[i], inds[i + 1]
+                delta_frequency = frequencies - (
+                    d.in_band(bin_lo, bin_lo + 1)[0] + d.in_band(bin_hi - 1, bin_hi)[0]) / 2
+            else:
+                delta_frequency = frequencies - self.bin_centers[i]
+
+            strain = chunk_strain[idxs]
+            psd = chunk_psd[idxs]
+
+            for j, (ell, emm) in enumerate(self.mode_array):
+                key = f'{ell},{emm}'
+                h0 = chunk_h0[key][idxs]
+                a0[key][i] += noise_weighted_inner_product(h0, strain, psd, duration)
+                a1[key][i] += noise_weighted_inner_product(h0, strain * delta_frequency, psd, duration)
+
+                for ellp, emmp in self.mode_array[j::]:
+                    keyp = f'{ellp},{emmp}'
+                    h0_p = chunk_h0[keyp][idxs]
+                    b0[key][keyp][i] += noise_weighted_inner_product(h0_p, h0, psd, duration)
+                    b1[key][keyp][i] += noise_weighted_inner_product(h0_p, h0 * delta_frequency, psd, duration)
+                    b2[key][keyp][i] += noise_weighted_inner_product(
+                        h0_p * delta_frequency, h0 * delta_frequency, psd, duration)
+
+            if injection is None:
+                continue
+            d.s_inner_s += noise_weighted_inner_product(strain, strain, psd, duration).real
+            if not injection.noise:
+                continue
+            h0s = np.array([chunk_h0[f'{ell},{emm}'][idxs]
+                            for ell, emm in self.mode_array])
+            basis = np.concatenate([h0s, h0s * delta_frequency, strain[None]])
+            # gram[i, j] = <g_i | g_j>; the noise terms <g_i | n> have
+            # E[x_i x_j^*] = 2 gram[i, j] for bilby's noise normalisation
+            piece_gram = 4 / duration * (basis.conj() / psd) @ basis.T
+            d.gram[i] = piece_gram if i not in d.gram else d.gram[i] + piece_gram
+            if not bin_complete:
+                continue
+            noise = complex_gaussian(2 * d.gram.pop(i), d.z[i])
+            for j, (ell, emm) in enumerate(self.mode_array):
+                a0[f'{ell},{emm}'][i] += noise[j]
+                a1[f'{ell},{emm}'][i] += noise[n_modes + j]
+            d.s_inner_n += noise[-1]
+
+    def _summary_data_result(self, d):
+        """The summary data of ``d`` once all its pieces are in."""
+        result = {'a0': dict(), 'a1': dict(), 'b0': dict(), 'b1': dict(), 'b2': dict()}
+        for i, (ell, emm) in enumerate(self.mode_array):
+            key = f'{ell},{emm}'
+            result['a0'][key] = d.a0[key]
+            result['a1'][key] = d.a1[key]
+            for kind in ('b0', 'b1', 'b2'):
+                result[kind].setdefault(key, dict())
+            for ellp, emmp in self.mode_array[i::]:
+                keyp = f'{ellp},{emmp}'
+                for kind in ('b0', 'b1', 'b2'):
+                    result[kind].setdefault(keyp, dict())
+                    values = getattr(d, kind)[key][keyp]
+                    result[kind][key][keyp] = values
+                    result[kind][keyp][key] = np.conj(values)
+        return result
+
     def compute_summary_data(self):
         """Compute summary data for the likelihood.
 
         The per-mode fiducial detector waveforms are projected in frequency
         chunks of ``summary_data_chunk_size`` samples rather than all at once,
         so the full-resolution waveform never has to sit in memory. The result
-        is identical to an unchunked computation.
+        is identical to an unchunked computation. Interferometers with the
+        same band (and no notches) walk the chunks together, so that each
+        chunk's source evaluations serve all of them.
 
         The actual (injected/real) strain data is also read in chunks,
         straight off a disk-backed memory-mapped copy
@@ -1495,21 +1869,31 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         instead the injected signal, evaluated per chunk, and each bin's
         a0/a1 get a draw of their noise terms, sampled together with the
         noise term of <s|d>, which gives :meth:`noise_log_likelihood`. See
-        :class:`bilby_xG.injection.SummaryDataInjection`.
+        :class:`bilby_xG.injection.SummaryDataInjection`. With
+        ``summary_data_quadrature`` (such an injection only) wide bins are
+        integrated by Gauss-Legendre quadrature rather than summed over
+        their samples (:meth:`_summary_data_plan`).
 
         With ``summary_data_checkpoint`` the partial sums are saved there
         (every ``summary_data_checkpoint_interval`` seconds and after each
-        interferometer) and a later call for the same summary data resumes
-        from them, with the same result; the file is removed once done.
+        group of interferometers) and a later call for the same summary data
+        resumes from them, with the same result; the file is removed once
+        done.
         """
-        summary_data = dict()
         injection = self.injection
-        n_modes = len(self.mode_array)
+        if getattr(self, "summary_data_quadrature", False):
+            if injection is None or getattr(injection, "data", False) or self.legacy:
+                raise ValueError("summary_data_quadrature needs an injection as summary data "
+                                 "(its signal at any frequency), not data on the grid or legacy")
+            if any(ifo.strain_data.notch_list for ifo in self.interferometers):
+                raise ValueError("summary_data_quadrature does not support notches")
+        summary_data = dict()
         network_s_inner_s, network_s_inner_n = 0.0, 0.0
         state = self._load_summary_data_checkpoint(self._summary_data_fingerprint())
         interval = getattr(self, "summary_data_checkpoint_interval", 600.0)
         last_save = time.monotonic()
 
+        groups = dict()
         for interferometer in self.interferometers:
             if interferometer.name in state["done"]:
                 summary_data[interferometer.name], s_inner_s, s_inner_n = \
@@ -1517,226 +1901,59 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                 network_s_inner_s += s_inner_s
                 network_s_inner_n += np.real(s_inner_n)
                 continue
-            if injection is None:
-                interferometer.offload_frequency_domain_strain(self.array_cache_dir)
-            interferometer.discard_regenerable_frequency_caches()
-            logger.info(
-                f"Computing summary data for {interferometer.name} "
-                f"({self.number_of_bins} bins).")
-            summary_data[interferometer.name] = {
-                'a0': dict(),
-                'a1': dict(),
-                'b0': dict(),
-                'b1': dict(),
-                'b2': dict()
-            }
+            d = self._summary_data_detector(interferometer)
+            groups.setdefault(d.group_key, []).append(d)
 
-            # the in-band frequencies, bilby's frequency_mask: without
-            # notches, the grid's [minimum_frequency, maximum_frequency]
-            # index range, walked a chunk at a time (no full-band array, so
-            # memory does not grow with the duration); with notches, the
-            # mask itself (full band)
-            grid = FrequencyGrid.of(interferometer.strain_data)
-            if interferometer.strain_data.notch_list:
-                mask = interferometer.frequency_mask
-                in_band_indices = np.flatnonzero(mask)
-                masked_frequency_array = grid.at(in_band_indices)
-                raw_offset = None
-
-                def in_band(lo, hi):
-                    return masked_frequency_array[lo:hi]
-
-                masked_bin_inds = np.searchsorted(masked_frequency_array, self.bin_freqs)
-            else:
-                raw_offset, _ = grid.band(interferometer.minimum_frequency,
-                                          interferometer.maximum_frequency)
-                in_band_indices = None
-
-                def in_band(lo, hi):
-                    return grid.frequencies(raw_offset + lo, raw_offset + hi)
-
-                masked_bin_inds = grid.searchsorted(self.bin_freqs) - raw_offset
-            duration = interferometer.duration
-            raw_strain = (None if injection is not None
-                          else interferometer.strain_data._frequency_domain_strain)
-            psd_model = interferometer.power_spectral_density
-            window_power_correction = interferometer._window_power_correction
-            a0, b0, a1, b1, b2 = dict(), dict(), dict(), dict(), dict()
-            s_inner_s, s_inner_n = 0.0, 0j
-            if injection is not None and injection.noise:
-                # standard circular complex normals, one per basis function
-                # (h0_k, h0_k (f - f_m) for every mode k, and the signal) per
-                # bin, drawn up front so the realisation does not depend on
-                # the chunking
-                rng = injection.noise_generator(interferometer)
-                z = (rng.standard_normal((self.number_of_bins, 2 * n_modes + 1))
-                     + 1j * rng.standard_normal((self.number_of_bins, 2 * n_modes + 1))
-                     ) / np.sqrt(2)
-
-            for j, (ell, emm) in enumerate(self.mode_array):
-                key = f'{ell},{emm}'
-                b0[key] = dict()
-                b1[key] = dict()
-                b2[key] = dict()
-                a0[key], a1[key] = np.zeros((2, self.number_of_bins), dtype=complex)
-
-                for ellp, emmp in self.mode_array[j::]:
-                    (b0[key][f'{ellp},{emmp}'], b1[key][f'{ellp},{emmp}'],
-                     b2[key][f'{ellp},{emmp}']) = np.zeros((3, self.number_of_bins), dtype=complex)
-
-            gram = dict()
+        for group in groups.values():
+            names = [d.name for d in group]
+            logger.info(f"Computing summary data for {', '.join(names)} "
+                        f"({self.number_of_bins} bins, {len(group[0].pieces)} pieces).")
             resume = state["current"]
             next_piece = 0
-            if resume is not None and resume["name"] == interferometer.name:
-                a0, a1, b0, b1, b2 = (resume[k] for k in ("a0", "a1", "b0", "b1", "b2"))
-                s_inner_s, s_inner_n, gram = resume["s_inner_s"], resume["s_inner_n"], resume["gram"]
+            if resume is not None and resume["names"] == names:
+                for d in group:
+                    for key in self._SUMS:
+                        setattr(d, key, resume["detectors"][d.name][key])
                 next_piece = resume["next_piece"]
-            for piece, (chunk_start, chunk_end, chunk_lo, chunk_hi) in enumerate(
-                    self._summary_data_pieces(masked_bin_inds)):
-                if piece < next_piece:  # done before the checkpoint
+            for piece_index, piece in enumerate(group[0].pieces):
+                if piece_index < next_piece:  # done before the checkpoint
                     continue
-                chunk_frequencies = in_band(chunk_lo, chunk_hi)
-                chunk_psd = (
-                    psd_model.get_power_spectral_density_array(chunk_frequencies)
-                    * window_power_correction)
-                chunk_h0 = {
-                    f'{ell},{emm}': self._reference_mode(
-                        interferometer, f'{ell},{emm}', chunk_frequencies)
-                    for ell, emm in self.mode_array
-                }
-                if raw_strain is None and self.legacy:
-                    # the fork's injection: its fiducial modes with |m| of
-                    # 2, 3 or 4 (the bins end below the fiducial's zeroing)
-                    chunk_strain = sum(chunk_h0[f'{ell},{emm}'] for ell, emm in self.mode_array
-                                       if abs(emm) in LEGACY_INJECTION_M)
-                elif raw_strain is None:
-                    chunk_strain = injection.signal(interferometer, chunk_frequencies)
-                elif in_band_indices is None:
-                    chunk_strain = raw_strain[
-                        raw_offset + chunk_lo:raw_offset + chunk_hi]
-                else:
-                    chunk_strain = raw_strain[in_band_indices[chunk_lo:chunk_hi]]
-
-                logger.info(
-                    f"{interferometer.name}: summary data bins "
-                    f"{chunk_start}-{chunk_end}/{self.number_of_bins} "
-                    f"({chunk_end / self.number_of_bins:.0%}), "
-                    f"frequencies [{chunk_frequencies[0]:.3g}, "
-                    f"{chunk_frequencies[-1]:.3g}] Hz.")
-
-                for i in range(chunk_start, chunk_end):
-                    # the part of bin i in this piece (all of it, unless the
-                    # bin is wider than a chunk and split into pieces)
-                    bin_lo, bin_hi = masked_bin_inds[i], masked_bin_inds[i + 1]
-                    idxs = slice(max(bin_lo, chunk_lo) - chunk_lo,
-                                 min(bin_hi, chunk_hi) - chunk_lo)
-                    bin_complete = bin_hi <= chunk_hi
-
-                    frequencies = chunk_frequencies[idxs]
-                    # the centre the ratios' r0 refer to (the midpoint of the
-                    # bin edges), not that of the samples in the bin: they
-                    # differ by up to a sample spacing, an error of r1 times
-                    # it which more bins do not reduce (legacy: the fork's,
-                    # the samples' midpoint)
-                    if self.legacy:
-                        delta_frequency = frequencies - (
-                            in_band(bin_lo, bin_lo + 1)[0] + in_band(bin_hi - 1, bin_hi)[0]) / 2
-                    else:
-                        delta_frequency = frequencies - self.bin_centers[i]
-
-                    strain = chunk_strain[idxs]
-                    psd = chunk_psd[idxs]
-
-                    for j, (ell, emm) in enumerate(self.mode_array):
-                        key = f'{ell},{emm}'
-                        h0 = chunk_h0[key][idxs]
-                        a0[key][i] += noise_weighted_inner_product(h0, strain, psd, duration)
-                        a1[key][i] += noise_weighted_inner_product(h0, strain * delta_frequency, psd, duration)
-
-                        for ellp, emmp in self.mode_array[j::]:
-                            keyp = f'{ellp},{emmp}'
-                            h0_p = chunk_h0[keyp][idxs]
-                            b0[key][keyp][i] += noise_weighted_inner_product(h0_p, h0, psd, duration)
-                            b1[key][keyp][i] += noise_weighted_inner_product(h0_p, h0 * delta_frequency, psd, duration)
-                            b2[key][keyp][i] += noise_weighted_inner_product(
-                                h0_p * delta_frequency, h0 * delta_frequency, psd, duration)
-
-                    if injection is None:
-                        continue
-                    s_inner_s += noise_weighted_inner_product(strain, strain, psd, duration).real
-                    if not injection.noise:
-                        continue
-                    h0s = np.array([chunk_h0[f'{ell},{emm}'][idxs]
-                                    for ell, emm in self.mode_array])
-                    basis = np.concatenate([h0s, h0s * delta_frequency, strain[None]])
-                    # gram[i, j] = <g_i | g_j>; the noise terms <g_i | n> have
-                    # E[x_i x_j^*] = 2 gram[i, j] for bilby's noise normalisation
-                    piece_gram = 4 / duration * (basis.conj() / psd) @ basis.T
-                    gram[i] = piece_gram if i not in gram else gram[i] + piece_gram
-                    if not bin_complete:
-                        continue
-                    noise = complex_gaussian(2 * gram.pop(i), z[i])
-                    for j, (ell, emm) in enumerate(self.mode_array):
-                        a0[f'{ell},{emm}'][i] += noise[j]
-                        a1[f'{ell},{emm}'][i] += noise[n_modes + j]
-                    s_inner_n += noise[-1]
-
+                for d in group:
+                    self._summary_data_piece(d, piece)
                 if time.monotonic() - last_save >= interval:
                     state["current"] = dict(
-                        name=interferometer.name, next_piece=piece + 1, a0=a0, a1=a1, b0=b0,
-                        b1=b1, b2=b2, s_inner_s=s_inner_s, s_inner_n=s_inner_n, gram=gram)
+                        names=names, next_piece=piece_index + 1,
+                        detectors={d.name: {key: getattr(d, key) for key in self._SUMS}
+                                   for d in group})
                     self._save_summary_data_checkpoint(state)
                     last_save = time.monotonic()
 
-            if injection is not None:
-                snr = np.sqrt(s_inner_s)
-                message = (f"{interferometer.name}: <d|d>^(1/2) {snr:.2f}"
-                           if getattr(injection, "data", False)
-                           else f"{interferometer.name}: injected optimal SNR {snr:.2f}")
-                if injection.noise:
-                    message += f", matched-filter SNR {(s_inner_s + s_inner_n.real) / snr:.2f}"
-                logger.info(message)
-                network_s_inner_s += s_inner_s
-                network_s_inner_n += s_inner_n.real
-
-            for i, (ell, emm) in enumerate(self.mode_array):
-                key = f'{ell},{emm}'
-                summary_data[interferometer.name]['a0'][key] = a0[key]
-                summary_data[interferometer.name]['a1'][key] = a1[key]
-                if key not in summary_data[interferometer.name]['b0']:
-                    summary_data[interferometer.name]['b0'][key] = dict()
-                    summary_data[interferometer.name]['b1'][key] = dict()
-                    summary_data[interferometer.name]['b2'][key] = dict()
-                for ellp, emmp in self.mode_array[i::]:
-                    keyp = f'{ellp},{emmp}'
-                    if keyp not in summary_data[interferometer.name]['b0']:
-                        summary_data[interferometer.name]['b0'][keyp] = dict()
-                        summary_data[interferometer.name]['b1'][keyp] = dict()
-                        summary_data[interferometer.name]['b2'][keyp] = dict()
-                    summary_data[interferometer.name]['b0'][key][keyp] = b0[key][keyp]
-                    summary_data[interferometer.name]['b1'][key][keyp] = b1[key][keyp]
-                    summary_data[interferometer.name]['b0'][keyp][key] = np.conj(b0[key][keyp])
-                    summary_data[interferometer.name]['b1'][keyp][key] = np.conj(b1[key][keyp])
-                    summary_data[interferometer.name]['b2'][key][keyp] = b2[key][keyp]
-                    summary_data[interferometer.name]['b2'][keyp][key] = np.conj(b2[key][keyp])
-
-            state["done"][interferometer.name] = (
-                summary_data[interferometer.name], s_inner_s, s_inner_n)
+            for d in group:
+                if injection is not None:
+                    snr = np.sqrt(d.s_inner_s)
+                    message = (f"{d.name}: <d|d>^(1/2) {snr:.2f}"
+                               if getattr(injection, "data", False)
+                               else f"{d.name}: injected optimal SNR {snr:.2f}")
+                    if injection.noise:
+                        message += (f", matched-filter SNR "
+                                    f"{(d.s_inner_s + d.s_inner_n.real) / snr:.2f}")
+                    logger.info(message)
+                    network_s_inner_s += d.s_inner_s
+                    network_s_inner_n += d.s_inner_n.real
+                summary_data[d.name] = self._summary_data_result(d)
+                state["done"][d.name] = (summary_data[d.name], d.s_inner_s, d.s_inner_n)
+                # Free this detector's full-band frequency array/mask/PSD
+                # cache (repopulated by the frequency_mask/frequency_array
+                # accesses): otherwise they stay attached to the
+                # interferometer (held for the likelihood's lifetime)
+                d.interferometer.discard_regenerable_frequency_caches()
             state["current"] = None
             self._save_summary_data_checkpoint(state)
             last_save = time.monotonic()
+            del group
 
-            # Free this detector's full-band frequency array/mask/PSD cache
-            # (repopulated above by the frequency_mask/frequency_array
-            # accesses) before moving to the next interferometer -- without
-            # this they stay attached to `interferometer` (and so to
-            # self.interferometers, held for the likelihood's lifetime) and
-            # accumulate across detectors instead of each one's being
-            # released once its summary data is done.
-            interferometer.discard_regenerable_frequency_caches()
-            del masked_bin_inds, raw_strain, in_band_indices, in_band
-
-        self.summary_data = summary_data
+        # in the interferometers' order
+        self.summary_data = {ifo.name: summary_data[ifo.name] for ifo in self.interferometers}
         path = getattr(self, "summary_data_checkpoint", None)
         if path is not None and os.path.exists(path):
             os.remove(path)

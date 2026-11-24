@@ -100,3 +100,27 @@ def test_precessing_matches_the_surrogate(model):
     for key in ("plus", "cross"):
         assert mismatch(total(teob, key), total(mlgw, key)) < tolerance
     assert np.all(teob["2,2"]["time_to_merger"][FREQS < 1000] > 0)
+
+
+def test_interpolated_modes_match_direct_calls():
+    """Chunks of the data grid interpolated from each mode's one call on the
+    slip-free grid (TEOBResumSRun.modes) are the per-chunk calls
+    (modes_direct) to well below the model's accuracy (~6e-7 of a mode's
+    peak at 1 kHz, 2e-8 at 3 Hz), each ~0.05 s rather than ~11 s."""
+    import bilby_xG.teobresums_mlgw as teobresums_mlgw
+    parameters = COMMON | dict(a_1=0.05, a_2=0.0014, tilt_1=np.pi / 2, tilt_2=0.0,
+                               phi_12=0.0, phi_jl=0.0, theta_jn=0.3491, phase=1.57)
+    args = ARGS | dict(reference_frequency=20.0, mlgw_bns_model="default_hom_lambda2000")
+    teobresums_mlgw_precessing_individual_modes(LOW[:100], **parameters, **args)
+    run = next(run for binary, run in teobresums_mlgw._RUNS.items()
+               if binary[0] == "precessing" and binary[1] == M)
+    modes = [tuple(mode) for mode in MLGW_BNS_MODES]
+    for f0 in (3.0, 100.0, 1000.0):
+        frequencies = f0 + np.arange(2 ** 15) / 25000.0
+        interpolated = run.modes(frequencies, modes)
+        direct = run.modes_direct(frequencies, modes)
+        for mode in modes:
+            for i in (0, 1):
+                peak = np.max(abs(direct[mode][i]))
+                np.testing.assert_allclose(interpolated[mode][i], direct[mode][i],
+                                           rtol=0, atol=2e-6 * peak)

@@ -39,6 +39,7 @@ own spin evolution undoes slightly differently.
 import dataclasses
 
 import numpy as np
+from scipy.interpolate import CubicSpline
 
 from .source import (MLGW_BNS_MODES, _check_mlgw_bns_modes, _mlgw_bns_model,
                      mlgw_bns_individual_modes, mlgw_bns_model_name)
@@ -59,6 +60,10 @@ FIT_POINTS = 4000
 #: largest advance (rad) of the fastest mode's phase between the points TEOBResumS
 #: is evaluated at, below pi
 SLIP_FREE_STEP = 2.5
+#: points of the slip-free grid beyond the requested frequencies on each side
+#: of the local splines of :meth:`TEOBResumSRun.modes` (their end conditions'
+#: influence decays by ~0.27 a point)
+DENSE_MARGIN = 16
 
 
 def slip_free_grid(total_mass, mass_ratio, minimum_frequency, maximum_frequency, m_max=4):
@@ -77,6 +82,16 @@ def slip_free_grid(total_mass, mass_ratio, minimum_frequency, maximum_frequency,
     geometric = np.geomspace(minimum_frequency, maximum_frequency,
                              int(np.log(maximum_frequency / minimum_frequency) / 1e-3) + 1)
     return np.union1d(chirp, geometric)
+
+
+def _chirp_coordinate(frequencies):
+    """x = -f^(-5/3), increasing with f: the inspiral phase is nearly linear in it"""
+    return -np.asarray(frequencies, dtype=float) ** (-5 / 3)
+
+
+def _chirp_coordinate_derivative(frequencies):
+    """dx / df"""
+    return 5 / 3 * np.asarray(frequencies, dtype=float) ** (-8 / 3)
 
 
 def _merger_top(model, total_mass):
@@ -153,6 +168,7 @@ class TEOBResumSRun:
         self.slip_free = slip_free_grid(start.total_mass, start.mass_ratio, minimum_frequency,
                                         1.05 * self.top[1], m_max)
         self.t_merger = None
+        self._dense = {}
         self.delta = self._fit_delta(target)
 
     @classmethod
@@ -218,6 +234,52 @@ class TEOBResumSRun:
         return hp * shift, hc * shift
 
     def modes(self, frequencies, modes):
+        """{(l, m): (hp, hc, time_to_merger)} at ``frequencies`` (increasing,
+        above f0): interpolated from each mode's one call on the slip-free
+        grid (:meth:`_dense_mode`), or, outside that grid, each mode's own
+        call on them merged with it (:meth:`modes_direct`)."""
+        frequencies = np.asarray(frequencies, dtype=float)
+        if not len(frequencies) or frequencies[0] < self.slip_free[0] \
+                or frequencies[-1] > self.slip_free[-1]:
+            return self.modes_direct(frequencies, modes)
+        shift = np.exp(-2j * np.pi * self.merger_time() * frequencies)
+        x = _chirp_coordinate(frequencies)
+        out = {}
+        for ell, emm in modes:
+            grid_x, phase, plus, cross = self._dense_mode(ell, emm)
+            lo = max(int(np.searchsorted(grid_x, x[0])) - DENSE_MARGIN, 0)
+            hi = min(int(np.searchsorted(grid_x, x[-1])) + DENSE_MARGIN, len(grid_x))
+            knots = grid_x[lo:hi]
+            spline = CubicSpline(knots, phase[lo:hi])
+            co_phase = spline(x)
+            carrier = np.exp(1j * co_phase)
+            hp = CubicSpline(knots, plus[lo:hi])(x) * carrier
+            hc = CubicSpline(knots, cross[lo:hi])(x) * carrier
+            # the co-precessing mode's own time-frequency map, about the merger
+            time = spline(x, 1) * _chirp_coordinate_derivative(frequencies) / (2 * np.pi) \
+                - self.merger_time()
+            out[(ell, emm)] = (hp * shift, hc * shift, time)
+        return out
+
+    def _dense_mode(self, ell, emm):
+        """Mode (l, m)'s one TEOBResumS call on the slip-free grid, kept as
+        functions of x = -f^(-5/3) (in which the inspiral phase is nearly
+        linear) smooth enough to interpolate: (x, its co-precessing phase
+        psi, hp and hc demodulated by it). psi is hflm's phase without its
+        -2 pi f tc (which the polarisations do not carry), unwrapped (the
+        slip-free grid's steps are below pi), so psi' / 2 pi is the time."""
+        if (ell, emm) not in self._dense:
+            from mlgw_bns.higher_order_modes import Mode, mode_to_k
+            k = mode_to_k(Mode(ell, emm))
+            hp, hc, hflm, dyn = self.run(self.slip_free, [k])
+            psi = np.unwrap(-np.asarray(hflm[str(k)][1])[1:]
+                            + 2 * np.pi * self.slip_free * float(dyn["tc"]))
+            demodulate = np.exp(-1j * psi)
+            self._dense[(ell, emm)] = (_chirp_coordinate(self.slip_free), psi,
+                                       hp * demodulate, hc * demodulate)
+        return self._dense[(ell, emm)]
+
+    def modes_direct(self, frequencies, modes):
         """{(l, m): (hp, hc, time_to_merger)} at ``frequencies`` (increasing,
         above f0), each mode its own call on them merged with the slip-free
         grid."""
