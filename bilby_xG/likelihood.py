@@ -27,8 +27,12 @@ Provides:
   bins chosen either by the closed-form arXiv:1806.08792 prescription or,
   optionally, that paper's adaptive bin-selection algorithm.
 """
+import hashlib
 import inspect
+import os
+import pickle
 import tempfile
+import time
 
 import numpy as np
 from scipy.optimize import differential_evolution
@@ -875,6 +879,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                  summary_data_chunk_size=2 ** 20,
                  array_cache_dir=None,
                  injection=None,
+                 summary_data_checkpoint=None,
+                 summary_data_checkpoint_interval=600.0,
                  precessing_scheme="ratio",
                  second_order=True,
                  legacy=False):
@@ -968,6 +974,11 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         # Keeping this well below the full band means the full-resolution
         # fiducial waveform never has to be held in memory at once.
         self.summary_data_chunk_size = summary_data_chunk_size
+        # where compute_summary_data saves its partial sums (None: nowhere),
+        # at most every interval seconds and after each interferometer, and
+        # resumes from them: a job that runs out of time loses at most that
+        self.summary_data_checkpoint = summary_data_checkpoint
+        self.summary_data_checkpoint_interval = summary_data_checkpoint_interval
         if array_cache_dir is None and injection is None:
             array_cache_dir = tempfile.mkdtemp(prefix="bilby_xG_array_cache_")
         self.array_cache_dir = array_cache_dir
@@ -1398,6 +1409,68 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
             for piece_lo in range(lo, hi, size):
                 yield start, end, piece_lo, min(piece_lo + size, hi)
 
+    def _summary_data_fingerprint(self):
+        """What the summary data depend on (besides real strain data, which
+        a run directory does not change): the interferometers, bins, modes,
+        chunking, response, fiducial and injection. A checkpoint with another
+        fingerprint is not resumed."""
+        injection = self.injection
+
+        def items(d):  # floats to 12 digits, as the bin edges below
+            return sorted((str(k), f"{v:.12g}" if isinstance(v, (float, np.floating))
+                           else repr(v)) for k, v in d.items())
+
+        parts = (
+            [ifo.name for ifo in self.interferometers], [list(m) for m in self.mode_array],
+            self.summary_data_chunk_size, bool(self.legacy),
+            (self.earth_rotation_time_delay, self.earth_rotation_beam_patterns,
+             self.finite_size, self.orbital_motion),
+            items(self.fiducial_parameters),
+            None if injection is None else (
+                injection.seed, injection.noise, items(injection.converted_parameters),
+                injection.waveform_generator.frequency_domain_source_model.__name__,
+                items(injection.waveform_generator.waveform_arguments)))
+        # the bins by their samples (grid indices) and their edges to 12
+        # digits: bins recomputed on another CPU, equal but for rounding,
+        # still resume
+        edges = np.asarray(self.bin_freqs, dtype=float)
+        digest = hashlib.sha256(repr(parts).encode())
+        digest.update(FrequencyGrid.of(self.waveform_generator).searchsorted(edges).tobytes())
+        digest.update(repr([float(f"{x:.12g}") for x in edges]).encode())
+        return digest.hexdigest()
+
+    def _load_summary_data_checkpoint(self, fingerprint):
+        """The saved state of :meth:`compute_summary_data`, if there is one
+        for these summary data, else a fresh one."""
+        fresh = dict(fingerprint=fingerprint, done=dict(), current=None)
+        path = getattr(self, "summary_data_checkpoint", None)
+        if path is None or not os.path.exists(path):
+            return fresh
+        try:
+            with open(path, "rb") as f:
+                state = pickle.load(f)
+        except Exception as error:  # a damaged file: start afresh
+            logger.warning(f"Summary data checkpoint {path} unreadable ({error}): starting afresh")
+            return fresh
+        if state.get("fingerprint") != fingerprint:
+            logger.warning(f"Summary data checkpoint {path} is for other bins, modes, "
+                           "fiducial or injection: starting afresh")
+            return fresh
+        current = state["current"]
+        logger.info(f"Summary data resumed from {path}: done {list(state['done']) or 'none'}"
+                    + (f", {current['name']} from piece {current['next_piece']}"
+                       if current else ""))
+        return state
+
+    def _save_summary_data_checkpoint(self, state):
+        path = getattr(self, "summary_data_checkpoint", None)
+        if path is None:
+            return
+        # write-then-rename: a job killed mid-write keeps the last checkpoint
+        with open(path + ".tmp", "wb") as f:
+            pickle.dump(state, f)
+        os.replace(path + ".tmp", path)
+
     def compute_summary_data(self):
         """Compute summary data for the likelihood.
 
@@ -1423,13 +1496,27 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
         a0/a1 get a draw of their noise terms, sampled together with the
         noise term of <s|d>, which gives :meth:`noise_log_likelihood`. See
         :class:`bilby_xG.injection.SummaryDataInjection`.
+
+        With ``summary_data_checkpoint`` the partial sums are saved there
+        (every ``summary_data_checkpoint_interval`` seconds and after each
+        interferometer) and a later call for the same summary data resumes
+        from them, with the same result; the file is removed once done.
         """
         summary_data = dict()
         injection = self.injection
         n_modes = len(self.mode_array)
         network_s_inner_s, network_s_inner_n = 0.0, 0.0
+        state = self._load_summary_data_checkpoint(self._summary_data_fingerprint())
+        interval = getattr(self, "summary_data_checkpoint_interval", 600.0)
+        last_save = time.monotonic()
 
         for interferometer in self.interferometers:
+            if interferometer.name in state["done"]:
+                summary_data[interferometer.name], s_inner_s, s_inner_n = \
+                    state["done"][interferometer.name]
+                network_s_inner_s += s_inner_s
+                network_s_inner_n += np.real(s_inner_n)
+                continue
             if injection is None:
                 interferometer.offload_frequency_domain_strain(self.array_cache_dir)
             interferometer.discard_regenerable_frequency_caches()
@@ -1498,8 +1585,16 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                      b2[key][f'{ellp},{emmp}']) = np.zeros((3, self.number_of_bins), dtype=complex)
 
             gram = dict()
-            for chunk_start, chunk_end, chunk_lo, chunk_hi in self._summary_data_pieces(
-                    masked_bin_inds):
+            resume = state["current"]
+            next_piece = 0
+            if resume is not None and resume["name"] == interferometer.name:
+                a0, a1, b0, b1, b2 = (resume[k] for k in ("a0", "a1", "b0", "b1", "b2"))
+                s_inner_s, s_inner_n, gram = resume["s_inner_s"], resume["s_inner_n"], resume["gram"]
+                next_piece = resume["next_piece"]
+            for piece, (chunk_start, chunk_end, chunk_lo, chunk_hi) in enumerate(
+                    self._summary_data_pieces(masked_bin_inds)):
+                if piece < next_piece:  # done before the checkpoint
+                    continue
                 chunk_frequencies = in_band(chunk_lo, chunk_hi)
                 chunk_psd = (
                     psd_model.get_power_spectral_density_array(chunk_frequencies)
@@ -1586,6 +1681,13 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                         a1[f'{ell},{emm}'][i] += noise[n_modes + j]
                     s_inner_n += noise[-1]
 
+                if time.monotonic() - last_save >= interval:
+                    state["current"] = dict(
+                        name=interferometer.name, next_piece=piece + 1, a0=a0, a1=a1, b0=b0,
+                        b1=b1, b2=b2, s_inner_s=s_inner_s, s_inner_n=s_inner_n, gram=gram)
+                    self._save_summary_data_checkpoint(state)
+                    last_save = time.monotonic()
+
             if injection is not None:
                 snr = np.sqrt(s_inner_s)
                 message = (f"{interferometer.name}: <d|d>^(1/2) {snr:.2f}"
@@ -1618,6 +1720,12 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
                     summary_data[interferometer.name]['b2'][key][keyp] = b2[key][keyp]
                     summary_data[interferometer.name]['b2'][keyp][key] = np.conj(b2[key][keyp])
 
+            state["done"][interferometer.name] = (
+                summary_data[interferometer.name], s_inner_s, s_inner_n)
+            state["current"] = None
+            self._save_summary_data_checkpoint(state)
+            last_save = time.monotonic()
+
             # Free this detector's full-band frequency array/mask/PSD cache
             # (repopulated above by the frequency_mask/frequency_array
             # accesses) before moving to the next interferometer -- without
@@ -1629,6 +1737,9 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
             del masked_bin_inds, raw_strain, in_band_indices, in_band
 
         self.summary_data = summary_data
+        path = getattr(self, "summary_data_checkpoint", None)
+        if path is not None and os.path.exists(path):
+            os.remove(path)
         if injection is not None:
             snr = np.sqrt(network_s_inner_s)
             message = f"Network injected optimal SNR {snr:.2f}"

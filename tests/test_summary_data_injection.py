@@ -1,4 +1,7 @@
 """Tests for injections as relative-binning summary data."""
+import os
+import pickle
+
 import numpy as np
 import pytest
 
@@ -35,14 +38,14 @@ def _waveform_generator():
             mode_array=[[2, 2], [2, 1], [3, 3]]))
 
 
-def _likelihood(noise=True, seed=1, chunk_size=2 ** 20):
+def _likelihood(noise=True, seed=1, chunk_size=2 ** 20, **kwargs):
     wfg = _waveform_generator()
     injection = SummaryDataInjection(wfg, INJECTION, START_TIME, FMIN, FMAX,
                                      noise=noise, seed=seed)
     return Likelihood(
         interferometers=InterferometerList(["ET-EMR"]), waveform_generator=wfg,
         fiducial_parameters=INJECTION, epsilon=0.05, time_reference="geocent",
-        summary_data_chunk_size=chunk_size, injection=injection)
+        summary_data_chunk_size=chunk_size, injection=injection, **kwargs)
 
 
 def _log_likelihood_ratio(likelihood, parameters):
@@ -212,3 +215,65 @@ def test_inner_product_is_the_norm_of_the_reconstruction():
     first_order = likelihood.calculate_snrs(polarizations, ifo,
                                             parameters=dict(likelihood.parameters))
     assert not np.isclose(first_order.optimal_snr_squared.real, expected, rtol=1e-6)
+
+
+class _Interrupted(Exception):
+    pass
+
+
+def _assert_same_summary_data(a, b):
+    for ifo in a.interferometers:
+        for kind, modes in a.summary_data[ifo.name].items():
+            for mode, values in modes.items():
+                other = b.summary_data[ifo.name][kind][mode]
+                if isinstance(values, dict):
+                    for modep, v in values.items():
+                        np.testing.assert_array_equal(other[modep], v)
+                else:
+                    np.testing.assert_array_equal(other, values)
+    assert a.noise_log_likelihood() == b.noise_log_likelihood()
+
+
+@pytest.mark.parametrize("saves", [3, 7])  # in the first detector; in a later one
+def test_summary_data_resume_from_a_checkpoint(tmp_path, monkeypatch, saves):
+    """A computation stopped after some checkpoints and started again gives
+    the same summary data as one that ran through, and removes its file."""
+    path = str(tmp_path / "summary_data.pkl")
+    reference = _likelihood(seed=5, chunk_size=1000)
+    save = Likelihood._save_summary_data_checkpoint
+    count = dict(n=0)
+
+    def interrupted_save(self, state):
+        save(self, state)
+        count["n"] += 1
+        if count["n"] == saves:
+            raise _Interrupted
+
+    monkeypatch.setattr(Likelihood, "_save_summary_data_checkpoint", interrupted_save)
+    with pytest.raises(_Interrupted):
+        _likelihood(seed=5, chunk_size=1000, summary_data_checkpoint=path,
+                    summary_data_checkpoint_interval=0)
+    monkeypatch.setattr(Likelihood, "_save_summary_data_checkpoint", save)
+    with open(path, "rb") as f:
+        state = pickle.load(f)
+    assert state["done"] or state["current"]["next_piece"] > 0
+    resumed = _likelihood(seed=5, chunk_size=1000, summary_data_checkpoint=path)
+    _assert_same_summary_data(reference, resumed)
+    assert not os.path.exists(path)
+
+
+def test_summary_data_checkpoint_of_other_data_is_ignored(tmp_path, monkeypatch):
+    path = str(tmp_path / "summary_data.pkl")
+    save = Likelihood._save_summary_data_checkpoint
+
+    def interrupted_save(self, state):
+        save(self, state)
+        raise _Interrupted
+
+    monkeypatch.setattr(Likelihood, "_save_summary_data_checkpoint", interrupted_save)
+    with pytest.raises(_Interrupted):
+        _likelihood(seed=5, chunk_size=1000, summary_data_checkpoint=path,
+                    summary_data_checkpoint_interval=0)
+    monkeypatch.setattr(Likelihood, "_save_summary_data_checkpoint", save)
+    other = _likelihood(seed=6, chunk_size=1000, summary_data_checkpoint=path)
+    _assert_same_summary_data(_likelihood(seed=6, chunk_size=1000), other)
