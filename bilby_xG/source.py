@@ -1990,7 +1990,7 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
         raise ValueError("Parameters outside the range of the mlgw_bns surrogate")
     if f_time is not None:
         phase = phase + 2 * np.pi * freqs * offset
-        times = np.where(amp > 0, times - offset, 0.0)
+        times = np.where(amp != 0, times - offset, 0.0)  # (2,1) has either sign
     # pi/2 - phase: the azimuth convention of the TEOBResumS SPA models
     plus, cross = mode_polarizations(amp, phase, modes, inclination,
                                      np.pi / 2.0 - coalescence_angle)

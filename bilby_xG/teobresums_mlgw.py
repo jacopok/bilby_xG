@@ -245,12 +245,15 @@ class TEOBResumSRun:
                 # the slope of the phase there; points close enough for
                 # TEOBResumS' phase not to slip
                 x = np.linspace(-1, 1, TIME_REFERENCE_POINTS)
-                _, _, hflm, dyn = self.run(f_time * (1 + TIME_REFERENCE_WINDOW * x), [k22], delta)
-                phase = np.unwrap(-np.asarray(hflm[str(k22)][1])[1:])
+                window = f_time * (1 + TIME_REFERENCE_WINDOW * x)
+                _, _, hflm, dyn = self.run(window, [k22], delta)
+                # without the -2 pi f tc first: tc can be a turn per point
+                phase = np.unwrap(-np.asarray(hflm[str(k22)][1])[1:]
+                                  + 2 * np.pi * window * float(dyn["tc"]))
                 slope = np.polynomial.Polynomial.fit(
                     x, phase - phase[len(x) // 2], 4, domain=[-1, 1]).deriv()(0.0)
                 t_reference = (slope / (TIME_REFERENCE_WINDOW * f_time) / (2 * np.pi)
-                               + float(dyn["tc"]) - offset)
+                               - offset)
                 if delta is None:
                     self.t_merger = t_reference
                 return t_reference

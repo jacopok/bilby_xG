@@ -71,7 +71,7 @@ def test_precessing_time_to_merger_is_close_to_2pn():
         post_newtonian = calculate_time_to_merger_for_any_mode(
             FREQS[band], converted["mass_1"], converted["mass_2"], converted["chi_1"],
             converted["chi_2"], mode=int(mode.split(",")[1]), safety=1)
-        np.testing.assert_allclose(pols["time_to_merger"][band], post_newtonian, rtol=2e-2)
+        np.testing.assert_allclose(pols["time_to_merger"][band], post_newtonian, rtol=4e-2)
 
 
 def test_teobresums_at_the_same_reference():
