@@ -1516,7 +1516,8 @@ class RelativeBinningGravitationalWaveTransientNextGenerationModebyMode(
             (self.earth_rotation_time_delay, self.earth_rotation_beam_patterns,
              self.finite_size, self.orbital_motion),
             items(self.fiducial_parameters),
-            None if injection is None else (
+            # real strain (xg_pe.strain.StrainData) has no simulation to identify
+            None if getattr(injection, "seed", None) is None else (
                 injection.seed, injection.noise, items(injection.converted_parameters),
                 injection.waveform_generator.frequency_domain_source_model.__name__,
                 items(injection.waveform_generator.waveform_arguments)))
