@@ -1885,6 +1885,47 @@ def _mlgw_bns_model(name=None):
     return _MLGW_BNS_MODELS[name]
 
 
+def mlgw_bns_time_reference(kwargs):
+    r"""``(frequency, offset)`` of the time parameter of the mlgw_bns sources,
+    from their waveform arguments: ``None, 0`` by default (``geocent_time`` is
+    the merger's).
+
+    With ``time_reference_frequency`` :math:`= f_0` (Hz), ``geocent_time`` is
+    instead the time at which the (2,2) mode emits :math:`f_0`, plus
+    ``time_reference_offset`` (s, default 0): a constant, e.g. the time to
+    merger from :math:`f_0` of the fiducial binary, so that ``geocent_time``
+    stays within milliseconds of the merger and the analysed segments and
+    priors need not move. The merger's time is the one that moves with the
+    masses, spins and tides; the time at ~100 Hz, where the signal is, does
+    not. It is a change of variable with unit Jacobian at fixed intrinsic
+    parameters: a flat prior stays flat, its bounds move. For aligned spins
+    ``phase`` is then the orbital phase at that time. ``"time_to_merger"`` is
+    then the time before ``geocent_time``.
+    """
+    frequency = kwargs.get("time_reference_frequency")
+    offset = float(kwargs.get("time_reference_offset") or 0.0)
+    if frequency is None:
+        if offset:
+            raise ValueError("time_reference_offset needs time_reference_frequency")
+        return None, 0.0
+    return float(frequency), offset
+
+
+def _time_reference_kwargs(frequency):
+    """mlgw_bns' argument, not passed when unused (mlgw_bns <= 2.1.0 lacks it)"""
+    return {} if frequency is None else dict(time_reference_frequency_hz=frequency)
+
+
+def mlgw_bns_has_precessing_times():
+    """Whether mlgw_bns gives the precessing multipoles' own time-frequency
+    maps (after 2.1.0); otherwise the detector response follows the 2PN ones."""
+    import inspect
+
+    from mlgw_bns.batched_precession import precessing_mode_components
+
+    return "return_tf" in inspect.signature(precessing_mode_components).parameters
+
+
 def convert_to_mlgw_bns_parameters(parameters):
     """``parameter_conversion`` for :func:`mlgw_bns_individual_modes`: bilby
     ``chirp_mass``/``mass_ratio``/``chi_1``/``chi_2``/``lambda_1``/``lambda_2``
@@ -1921,7 +1962,9 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
     merger is at the reference time (``geocent_time``), and
     ``coalescence_angle`` is the orbital phase there. The merger is where
     the frequency-domain phase of the (2,2) mode becomes linear, within a
-    few ``M`` of the peak of the TEOBResumS amplitude.
+    few ``M`` of the peak of the TEOBResumS amplitude. With the waveform
+    arguments ``time_reference_frequency`` and ``time_reference_offset`` the
+    reference time is another, see :func:`mlgw_bns_time_reference`.
 
     Each mode also carries its own time-frequency map, the time to merger
     :math:`-t_{\\ell m}(f) = \\partial_f \\phi_{\\ell m} / 2\\pi` (``"time_to_merger"``),
@@ -1939,10 +1982,15 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
                          f"available: {MLGW_BNS_MODES}")
 
     intrinsic = [max(q, 1.0 / q), LambdaAl2, LambdaBl2, chi1z, chi2z]  # q = m1 / m2 >= 1
+    f_time, offset = mlgw_bns_time_reference(kwargs)
     amp, phase, times = _mlgw_bns_model(kwargs.get("mlgw_bns_model")).predict_modes_amp_phase(
-        intrinsic, M, freqs, modes=modes, distance_mpc=distance, return_tf=True)
+        intrinsic, M, freqs, modes=modes, distance_mpc=distance, return_tf=True,
+        **_time_reference_kwargs(f_time))
     if not np.all(np.isfinite(amp)):
         raise ValueError("Parameters outside the range of the mlgw_bns surrogate")
+    if f_time is not None:
+        phase = phase + 2 * np.pi * freqs * offset
+        times = np.where(amp > 0, times - offset, 0.0)
     # pi/2 - phase: the azimuth convention of the TEOBResumS SPA models
     plus, cross = mode_polarizations(amp, phase, modes, inclination,
                                      np.pi / 2.0 - coalescence_angle)
@@ -1994,7 +2042,9 @@ def mlgw_bns_precessing_components(mode_array=None, n_steps=MLGW_BNS_PRECESSION_
     key = (mlgw_bns_model_name(model), modes, int(n_steps))
     if key not in _MLGW_BNS_PRECESSING:
         _MLGW_BNS_PRECESSING[key] = jax.jit(
-            precessing_mode_components(_mlgw_bns_model(model), modes, int(n_steps)))
+            precessing_mode_components(
+                _mlgw_bns_model(model), modes, int(n_steps),
+                **(dict(return_tf=True) if mlgw_bns_has_precessing_times() else {})))
     return _MLGW_BNS_PRECESSING[key]
 
 
@@ -2061,8 +2111,11 @@ def mlgw_bns_precessing_individual_modes(frequency_array, M, q, a_1, a_2, tilt_1
     :math:`c^{+,\times}_{\ell m'}(f) \, \tilde{h}^{\rm co}_{\ell m'}(f)`
     (:func:`mlgw_bns.batched_precession.precessing_mode_components`), whose
     ratio to the fiducial is smooth (Leslie, Dai and Pratten 2021, scheme 2)
-    and whose time-frequency map is that of the co-precessing mode, which the
-    detector response takes from the key's ``m``.
+    and whose time-frequency map is that of the co-precessing mode: the
+    surrogate's own (``"time_to_merger"``, as for the aligned spins) with an
+    mlgw_bns after 2.1.0, else the 2PN one for the key's ``m``. The time
+    reference is that of :func:`mlgw_bns_time_reference` (``phase`` stays the
+    orbital phase at ``reference_frequency``).
 
     ``hx`` follows LALSuite: it is minus mlgw_bns' (see mlgw_bns' known
     issues), so the polarisations agree with IMRPhenomXPHM's in the same
@@ -2092,9 +2145,10 @@ def mlgw_bns_precessing_individual_modes(frequency_array, M, q, a_1, a_2, tilt_1
     q = max(q, 1.0 / q)  # m1 / m2 >= 1
     arguments = (M, q, a_1, a_2, tilt_1, tilt_2, phi_12, phi_jl, LambdaAl2, LambdaBl2,
                  distance, theta_jn, phase, reference_frequency, start, n_steps, model)
+    f_time, offset = mlgw_bns_time_reference(kwargs)
     # the same binary at the same frequencies, mode by mode (the fiducial
     # waveform is evaluated that way): reuse the precession angles
-    cache_key = (arguments, len(freqs), hash(freqs.tobytes()))
+    cache_key = (arguments, len(freqs), hash(freqs.tobytes()), f_time)
     if _MLGW_BNS_PRECESSING_LAST.get("key") != cache_key:
         orientation = lvk_to_precessing(
             theta_jn, phi_jl, tilt_1, tilt_2, phi_12, a_1, a_2, M * q / (1 + q), M / (1 + q),
@@ -2112,14 +2166,18 @@ def mlgw_bns_precessing_individual_modes(frequency_array, M, q, a_1, a_2, tilt_1
             mlgw_bns_precessing_components(MLGW_BNS_MODES, n_steps, model), freqs[in_band], start,
             intrinsic, M, distance, orientation.inclination, orientation.azimuth,
             orientation.reference_phase, reference_frequency,
-            angles=_MLGW_BNS_ANGLES[angles_key])
+            angles=_MLGW_BNS_ANGLES[angles_key], **_time_reference_kwargs(f_time))
         if not all(np.all(np.isfinite(x)) for x in components):
             raise ValueError("Parameters outside the range of the mlgw_bns surrogate")
         _MLGW_BNS_PRECESSING_LAST.update(key=cache_key, components=components)
-    coprecessing, c_plus, c_cross = _MLGW_BNS_PRECESSING_LAST["components"]
+    coprecessing, c_plus, c_cross, *times = _MLGW_BNS_PRECESSING_LAST["components"]
+    if f_time is not None:
+        # not in place: the components are cached
+        times = [np.where(coprecessing != 0, times[0] - offset, 0.0)]
+        coprecessing = coprecessing * np.exp(2j * np.pi * freqs[in_band] * offset)
 
-    def full(values):
-        out = np.zeros(len(freqs), dtype=complex)
+    def full(values, dtype=complex):
+        out = np.zeros(len(freqs), dtype=dtype)
         out[in_band] = values
         return out
 
@@ -2132,6 +2190,8 @@ def mlgw_bns_precessing_individual_modes(frequency_array, M, q, a_1, a_2, tilt_1
         if kwargs.get("return_twist", False):
             mode.update(coprecessing=full(coprecessing[j]), c_plus=full(c_plus[j]),
                         c_cross=full(-c_cross[j]))
+        if times:
+            mode["time_to_merger"] = full(-times[0][j], float)
         polarizations[f"{ell},{emm}"] = mode
     return polarizations
 
@@ -2141,13 +2201,13 @@ def mlgw_bns_precessing_individual_modes(frequency_array, M, q, a_1, a_2, tilt_1
 mlgw_bns_precessing_individual_modes.evaluates_on_bin_edges = True
 
 
-def _evaluate_precessing(function, frequencies, start, intrinsic, *arguments, angles=None):
+def _evaluate_precessing(function, frequencies, start, intrinsic, *arguments, angles=None, **kwargs):
     """``function`` (a :func:`mlgw_bns_precessing_components`) for one binary
     at ``frequencies``, in pieces padded to one of
     :data:`MLGW_BNS_PRECESSING_LENGTHS`, with the precession ``angles``
     integrated from ``start`` (by ``function`` from ``start`` prepended to
-    each piece if not given). Returns ``(coprecessing, c_plus, c_cross)``,
-    of shape ``(n_modes, k)``."""
+    each piece if not given). Returns ``(coprecessing, c_plus, c_cross)`` (and
+    the times, if ``function`` gives them), of shape ``(n_modes, k)``."""
     longest = MLGW_BNS_PRECESSING_LENGTHS[-1] - 1
     pieces = []
     for low in range(0, max(len(frequencies), 1), longest):
@@ -2155,7 +2215,7 @@ def _evaluate_precessing(function, frequencies, start, intrinsic, *arguments, an
         length = next(n for n in MLGW_BNS_PRECESSING_LENGTHS if n > len(piece))
         grid = np.concatenate([[start], piece])
         grid = np.pad(grid, (0, length - len(grid)), mode="edge")
-        out = function(intrinsic, grid, *arguments, angles=angles)
+        out = function(intrinsic, grid, *arguments, angles=angles, **kwargs)
         pieces.append([np.asarray(x)[0, :, 1:len(piece) + 1] for x in out])
     return [np.concatenate(parts, axis=-1) for parts in zip(*pieces)]
 

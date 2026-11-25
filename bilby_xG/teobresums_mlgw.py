@@ -16,7 +16,13 @@ ODE started low enough for the highest-m mode to cover ``minimum_frequency``:
   map ``"time_to_merger"`` from its co-precessing phase;
 - the merger is where the surrogate puts it, the time of the tangent to the
   co-precessing (2,2) phase at the top of the surrogate's trained band
-  (TEOBResumS' own, its ``tc``, is ~65 us away for GW170817-like BNSs);
+  (TEOBResumS' own, its ``tc``, is ~65 us away for GW170817-like BNSs); or,
+  with a ``time_reference_frequency``
+  (:func:`bilby_xG.source.mlgw_bns_time_reference`), the time is that of the
+  co-precessing (2,2) at that frequency, below the merger, where TEOBResumS'
+  time-frequency map is smooth in the parameters to ~0.02 us (above, it
+  scatters by up to several us unless its SPA tail is attached between the
+  samples);
 - TEOBResumS imposes the spins, and zeroes its orbital phase, where its ODE
   starts. The binary is given at ``reference_frequency`` (aligned spins: at
   the merger): the spins, L and the line of sight are carried to the start
@@ -42,7 +48,8 @@ import numpy as np
 from scipy.interpolate import CubicSpline
 
 from .source import (MLGW_BNS_MODES, _check_mlgw_bns_modes, _mlgw_bns_model,
-                     mlgw_bns_individual_modes, mlgw_bns_model_name)
+                     mlgw_bns_individual_modes, mlgw_bns_model_name,
+                     mlgw_bns_time_reference)
 
 __author__ = ["Jacopo Tissino"]
 
@@ -102,6 +109,12 @@ def _chirp_coordinate(frequencies):
 def _chirp_coordinate_derivative(frequencies):
     """dx / df"""
     return 5 / 3 * np.asarray(frequencies, dtype=float) ** (-8 / 3)
+
+
+#: relative half-width and points of the window in which the time at a
+#: ``time_reference_frequency`` is fitted
+TIME_REFERENCE_WINDOW = 2e-3
+TIME_REFERENCE_POINTS = 513
 
 
 def _merger_top(model, total_mass):
@@ -171,8 +184,10 @@ class TEOBResumSRun:
     maximises the overlap with ``target(frequencies) -> (hp, hc)`` (mlgw_bns'
     convention), with the surrogate's merger reference."""
 
-    def __init__(self, model, start, f0, minimum_frequency, target):
+    def __init__(self, model, start, f0, minimum_frequency, target,
+                 time_reference=(None, 0.0)):
         self.model, self.start, self.f0 = model, start, f0
+        self.time_reference = time_reference
         m_max = max(mode.m for mode in model.modes)
         self.top = _merger_top(model, start.total_mass)
         self.slip_free = slip_free_grid(start.total_mass, start.mass_ratio, minimum_frequency,
@@ -218,12 +233,27 @@ class TEOBResumSRun:
     def merger_time(self, delta=None):
         """The polarisations' merger time at the surrogate's reference: the
         tangent to the co-precessing (2,2) phase at the top of its trained
-        band. hflm's phase (minus mlgw_bns') carries -2 pi f tc, tc
+        band (with a time reference frequency, what puts the tangent there at
+        minus its offset). hflm's phase (minus mlgw_bns') carries -2 pi f tc, tc
         (dyn["tc"]) in units of M, which the polarisations do not. Kept for
         the fitted turn."""
         if delta is not None or self.t_merger is None:
             from mlgw_bns.higher_order_modes import Mode, mode_to_k
             k22 = mode_to_k(Mode(2, 2))
+            f_time, offset = self.time_reference
+            if f_time is not None:
+                # the slope of the phase there; points close enough for
+                # TEOBResumS' phase not to slip
+                x = np.linspace(-1, 1, TIME_REFERENCE_POINTS)
+                _, _, hflm, dyn = self.run(f_time * (1 + TIME_REFERENCE_WINDOW * x), [k22], delta)
+                phase = np.unwrap(-np.asarray(hflm[str(k22)][1])[1:])
+                slope = np.polynomial.Polynomial.fit(
+                    x, phase - phase[len(x) // 2], 4, domain=[-1, 1]).deriv()(0.0)
+                t_reference = (slope / (TIME_REFERENCE_WINDOW * f_time) / (2 * np.pi)
+                               + float(dyn["tc"]) - offset)
+                if delta is None:
+                    self.t_merger = t_reference
+                return t_reference
             # TEOBResumS' interpolation needs more than the two points
             grid = np.union1d(np.geomspace(self.top[1] / 2, self.top[1], 16), self.top)
             at = np.searchsorted(grid, self.top)
@@ -407,8 +437,9 @@ def teobresums_mlgw_individual_modes(frequency_array, M, q, chi1z, chi2z, Lambda
     f_min, in_band = _band(freqs, kwargs.get("minimum_frequency"))
     name = mlgw_bns_model_name(kwargs.get("mlgw_bns_model"))
     q = max(q, 1.0 / q)  # m1 / m2 >= 1
+    time_reference = mlgw_bns_time_reference(kwargs)
     binary = ("aligned", M, q, chi1z, chi2z, LambdaAl2, LambdaBl2, distance, inclination,
-              coalescence_angle, f_min, name)
+              coalescence_angle, f_min, name, time_reference)
 
     def make():
         model = _mlgw_bns_model(name)
@@ -420,11 +451,13 @@ def teobresums_mlgw_individual_modes(frequency_array, M, q, chi1z, chi2z, Lambda
         def target(grid):
             surrogate = mlgw_bns_individual_modes(
                 grid, M, q, chi1z, chi2z, LambdaAl2, LambdaBl2, distance, inclination,
-                coalescence_angle, mlgw_bns_model=name, mode_array=MLGW_BNS_MODES)
+                coalescence_angle, mlgw_bns_model=name, mode_array=MLGW_BNS_MODES,
+                time_reference_frequency=time_reference[0],
+                time_reference_offset=time_reference[1])
             return (sum(m["plus"] for m in surrogate.values()),
                     sum(m["cross"] for m in surrogate.values()))
 
-        return TEOBResumSRun(model, start, f0, f_min, target)
+        return TEOBResumSRun(model, start, f0, f_min, target, time_reference)
 
     return _source(_run(binary, make), binary, freqs, in_band, modes, 1)
 
@@ -449,8 +482,10 @@ def teobresums_mlgw_precessing_individual_modes(frequency_array, M, q, a_1, a_2,
     reference_frequency = float(kwargs.get("reference_frequency", 50.0))
     name = mlgw_bns_model_name(kwargs.get("mlgw_bns_model"))
     q = max(q, 1.0 / q)  # m1 / m2 >= 1
+    time_reference = mlgw_bns_time_reference(kwargs)
     binary = ("precessing", M, q, a_1, a_2, tilt_1, tilt_2, phi_12, phi_jl, LambdaAl2,
-              LambdaBl2, distance, theta_jn, phase, reference_frequency, f_min, name)
+              LambdaBl2, distance, theta_jn, phase, reference_frequency, f_min, name,
+              time_reference)
 
     def make():
         model = _mlgw_bns_model(name)
@@ -458,9 +493,12 @@ def teobresums_mlgw_precessing_individual_modes(frequency_array, M, q, a_1, a_2,
         P = PrecessingParametersWithExtrinsic.from_lvk(
             M * q / (1 + q), M / (1 + q), theta_jn, phi_jl, tilt_1, tilt_2, phi_12, a_1, a_2,
             phase, reference_frequency, LambdaAl2, LambdaBl2, distance)
+        if time_reference[0] is not None:
+            P = dataclasses.replace(P, time_reference_frequency_hz=time_reference[0],
+                                    merger_time=-time_reference[1])
         precessing = PrecessingModel(model)
         return TEOBResumSRun(model, transported(P, f_spins), f0, f_min,
-                             lambda grid: precessing.predict(grid, P))
+                             lambda grid: precessing.predict(grid, P), time_reference)
 
     # hx with LALSuite's sign, as mlgw_bns_precessing_individual_modes
     return _source(_run(binary, make), binary, freqs, in_band, modes, -1)

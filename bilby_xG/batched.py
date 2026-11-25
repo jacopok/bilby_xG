@@ -48,7 +48,7 @@ __author__ = ["Jacopo Tissino"]
 _DAY = 24. * 60. * 60.
 
 
-def mlgw_bns_jax_modes(model, mode_array):
+def mlgw_bns_jax_modes(model, mode_array, waveform_arguments=None):
     """A JAX function evaluating selected mlgw_bns modes for a batch.
 
     Returns ``modes(theta, total_mass, distance, inclination, phase,
@@ -58,15 +58,23 @@ def mlgw_bns_jax_modes(model, mode_array):
     chi_1, chi_2]``, and the other parameters of shape ``(n,)``: the same
     per-mode polarisations as :func:`bilby_xG.source.mlgw_bns_individual_modes`
     (up to the rounding of the surrogate's regressors). Rows outside the
-    surrogate's range are NaN.
+    surrogate's range are NaN. The time reference is that of the
+    ``waveform_arguments`` (:func:`bilby_xG.source.mlgw_bns_time_reference`).
     """
     import jax.numpy as jnp
     from mlgw_bns.batched import mode_polarizations
 
+    from .source import _time_reference_kwargs, mlgw_bns_time_reference
+
+    f_time, offset = mlgw_bns_time_reference(waveform_arguments or {})
+    time_reference = _time_reference_kwargs(f_time)
     predict = model.jax_modes_amp_phase(mode_array, return_tf=True)
 
     def modes(theta, total_mass, distance, inclination, phase, frequencies):
-        amp, phi, times = predict(theta, total_mass, frequencies, distance)
+        amp, phi, times = predict(theta, total_mass, frequencies, distance, **time_reference)
+        if f_time is not None:
+            phi = phi + 2 * jnp.pi * frequencies * offset
+            times = jnp.where(amp == 0, 0.0, times - offset)
         # pi/2 - phase: the azimuth convention of the TEOBResumS SPA models
         plus, cross = mode_polarizations(amp, phi, mode_array, inclination,
                                          jnp.pi / 2 - phase, xp=jnp)
@@ -79,9 +87,11 @@ def mlgw_bns_precessing_jax_modes(mode_array, frequencies, waveform_arguments, t
     """A JAX function evaluating selected precessing mlgw_bns modes for a
     batch, at fixed ``frequencies``.
 
-    Returns ``modes(p) -> (plus, cross)``, or with ``twist`` ``modes(p) ->
-    (coprecessing, c_plus, c_cross)`` (``plus = c_plus * coprecessing``),
-    each of shape ``(n, n_modes, n_freqs)``, with ``p`` a dict of arrays of shape ``(n,)``: ``q >= 1``,
+    Returns ``modes(p) -> ((plus, cross), time_to_merger)``, or with ``twist``
+    ``modes(p) -> ((coprecessing, c_plus, c_cross), time_to_merger)``
+    (``plus = c_plus * coprecessing``); ``time_to_merger`` is None if mlgw_bns
+    does not give it (:func:`bilby_xG.source.mlgw_bns_has_precessing_times`).
+    The arrays are each of shape ``(n, n_modes, n_freqs)``, with ``p`` a dict of arrays of shape ``(n,)``: ``q >= 1``,
     ``lambda_1``, ``lambda_2``, ``total_mass``, ``distance`` and the LVK
     spins ``a_1, a_2, tilt_1, tilt_2, phi_12, phi_jl, theta_jn, phase``. The
     same per-mode polarisations as
@@ -95,7 +105,8 @@ def mlgw_bns_precessing_jax_modes(mode_array, frequencies, waveform_arguments, t
     from mlgw_bns.precessing_model import PrecessingModel
     from mlgw_bns.spin_conversion import lvk_to_precessing
 
-    from .source import (MLGW_BNS_PRECESSION_STEPS, _mlgw_bns_model,
+    from .source import (MLGW_BNS_PRECESSION_STEPS, _mlgw_bns_model, _time_reference_kwargs,
+                         mlgw_bns_has_precessing_times, mlgw_bns_time_reference,
                          mlgw_bns_precessing_start_frequency)
 
     frequencies = np.asarray(frequencies, dtype=float)
@@ -107,7 +118,11 @@ def mlgw_bns_precessing_jax_modes(mode_array, frequencies, waveform_arguments, t
     # the angles are integrated from the first frequency
     grid = np.concatenate([[start], frequencies[in_band]])
     predict = PrecessingModel(_mlgw_bns_model(waveform_arguments.get("mlgw_bns_model"))
-                              ).jax_predict_modes(mode_array, n_steps)
+                              ).jax_predict_modes(
+        mode_array, n_steps,
+        **(dict(return_tf=True) if mlgw_bns_has_precessing_times() else {}))
+    f_time, offset = mlgw_bns_time_reference(waveform_arguments)
+    time_reference = _time_reference_kwargs(f_time)
 
     def modes(p):
         q = p["q"]
@@ -118,20 +133,25 @@ def mlgw_bns_precessing_jax_modes(mode_array, frequencies, waveform_arguments, t
         intrinsic = jnp.concatenate([
             jnp.stack([q, p["lambda_1"], p["lambda_2"]], axis=1),
             orientation.chi_1, orientation.chi_2], axis=1)
-        coprecessing, c_plus, c_cross = predict(
+        coprecessing, c_plus, c_cross, *times = predict(
             intrinsic, jnp.asarray(grid), p["total_mass"], p["distance"],
             orientation.inclination, orientation.azimuth, orientation.reference_phase,
-            reference_frequency)
+            reference_frequency, **time_reference)
+        if f_time is not None:
+            times = [jnp.where(coprecessing == 0, 0.0, times[0] - offset)]
+            coprecessing = coprecessing * jnp.exp(2j * jnp.pi * grid * offset)
         shape = coprecessing.shape[:2] + (len(frequencies),)
         index = np.flatnonzero(in_band)
 
-        def full(values):
-            return jnp.zeros(shape, complex).at[..., index].set(values[..., 1:])
+        def full(values, dtype=complex):
+            return jnp.zeros(shape, dtype).at[..., index].set(values[..., 1:])
 
         # hx with LALSuite's sign, as the numpy source
+        time_to_merger = full(-times[0], float) if times else None
         if twist:
-            return full(coprecessing), full(c_plus), full(-c_cross)
-        return full(c_plus * coprecessing), full(-c_cross * coprecessing)
+            return (full(coprecessing), full(c_plus), full(-c_cross)), time_to_merger
+        return ((full(c_plus * coprecessing), full(-c_cross * coprecessing)),
+                time_to_merger)
 
     return modes
 
@@ -343,7 +363,8 @@ class BatchedRelativeBinningLikelihood(Likelihood):
                 self.mode_array, self.frequencies, wfg.waveform_arguments, twist=self.split)
         else:
             self._modes = mlgw_bns_jax_modes(
-                _mlgw_bns_model(wfg.waveform_arguments.get("mlgw_bns_model")), self.mode_array)
+                _mlgw_bns_model(wfg.waveform_arguments.get("mlgw_bns_model")), self.mode_array,
+                wfg.waveform_arguments)
         self._batched = jax.jit(self._batch)
 
     def _batch(self, p, arrays):
@@ -352,8 +373,7 @@ class BatchedRelativeBinningLikelihood(Likelihood):
         import jax.numpy as jnp
 
         if self.precessing:
-            # no waveform t(f) from the precessing surrogate: the PN one, per m
-            modes, time_to_merger = self._modes(p), None
+            modes, time_to_merger = self._modes(p)
         else:
             theta = jnp.stack([p["q"], p["lambda_1"], p["lambda_2"], p["chi_1"], p["chi_2"]],
                               axis=1)
@@ -361,7 +381,7 @@ class BatchedRelativeBinningLikelihood(Likelihood):
                 theta, p["total_mass"], p["distance"], p["inclination"], p["phase"],
                 arrays["frequencies"])
             modes = (plus, cross)
-        ln_l = jax.vmap(self._project, in_axes=(0, 0, 0, None))(
+        ln_l = jax.vmap(self._project, in_axes=(0, 0, None if time_to_merger is None else 0, None))(
             p, modes, time_to_merger, arrays)
         # outside the surrogate's range: outside the support
         return jnp.where(jnp.isnan(ln_l), -jnp.inf, ln_l)
