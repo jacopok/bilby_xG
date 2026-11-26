@@ -1960,7 +1960,11 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
 
     The surrogate is referenced to the merger (mlgw_bns after 1.0): the
     merger is at the reference time (``geocent_time``), and
-    ``coalescence_angle`` is the orbital phase there. The merger is where
+    ``coalescence_angle`` is the orbital phase there, LALSuite's
+    :math:`\phi_{\rm ref}`: :math:`h_+ - i h_\times = \sum h_{\ell m}
+    {}_{-2}Y_{\ell m}(\iota, \pi/2 - \phi_{\rm ref})`, as mlgw_bns'
+    ``convention="lal"`` (:mod:`mlgw_bns.conventions`) and the precessing
+    :func:`mlgw_bns_precessing_individual_modes`. The merger is where
     the frequency-domain phase of the (2,2) mode becomes linear, within a
     few ``M`` of the peak of the TEOBResumS amplitude. With the waveform
     arguments ``time_reference_frequency`` and ``time_reference_offset`` the
@@ -1973,6 +1977,7 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
     :meth:`bilby_xG.interferometer.Interferometer.get_detector_response_for_frequency_dependent_antenna_response`).
     """
     from mlgw_bns.batched import mode_polarizations
+    from mlgw_bns.conventions import aligned_internal_phase
 
     freqs = np.asarray(kwargs.get("frequency_bin_edges", frequency_array), dtype=float)
     modes = [(int(ell), int(emm)) for ell, emm in kwargs.get("mode_array", MLGW_BNS_MODES)]
@@ -1991,9 +1996,9 @@ def mlgw_bns_individual_modes(frequency_array, M, q, chi1z, chi2z, LambdaAl2,
     if f_time is not None:
         phase = phase + 2 * np.pi * freqs * offset
         times = np.where(amp != 0, times - offset, 0.0)  # (2,1) has either sign
-    # pi/2 - phase: the azimuth convention of the TEOBResumS SPA models
+    # the phase in LALSuite's convention, as mlgw_bns.Model.predict
     plus, cross = mode_polarizations(amp, phase, modes, inclination,
-                                     np.pi / 2.0 - coalescence_angle)
+                                     aligned_internal_phase(coalescence_angle))
     return {f"{ell},{emm}": {"plus": plus[0, j], "cross": cross[0, j],
                              "time_to_merger": -times[0, j]}
             for j, (ell, emm) in enumerate(modes)}

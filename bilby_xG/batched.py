@@ -63,6 +63,7 @@ def mlgw_bns_jax_modes(model, mode_array, waveform_arguments=None):
     """
     import jax.numpy as jnp
     from mlgw_bns.batched import mode_polarizations
+    from mlgw_bns.conventions import aligned_internal_phase
 
     from .source import _time_reference_kwargs, mlgw_bns_time_reference
 
@@ -75,9 +76,9 @@ def mlgw_bns_jax_modes(model, mode_array, waveform_arguments=None):
         if f_time is not None:
             phi = phi + 2 * jnp.pi * frequencies * offset
             times = jnp.where(amp == 0, 0.0, times - offset)
-        # pi/2 - phase: the azimuth convention of the TEOBResumS SPA models
+        # the phase in LALSuite's convention, as the numpy source
         plus, cross = mode_polarizations(amp, phi, mode_array, inclination,
-                                         jnp.pi / 2 - phase, xp=jnp)
+                                         aligned_internal_phase(phase), xp=jnp)
         return plus, cross, -times
 
     return modes

@@ -447,9 +447,12 @@ def teobresums_mlgw_individual_modes(frequency_array, M, q, chi1z, chi2z, Lambda
     def make():
         model = _mlgw_bns_model(name)
         f0, f_spins = TEOBResumSRun.frequencies(model, f_min)
+        # the azimuth here is mlgw_bns' internal one (TEOBResumS'
+        # coalescence_angle - pi/2), as everywhere in TEOBResumSRun; the turn
+        # about L that matches the target is fitted
         start = PrecessingParametersWithExtrinsic(
             q, LambdaAl2, LambdaBl2, (0.0, 0.0, chi1z), (0.0, 0.0, chi2z), distance,
-            inclination, M, reference_frequency_hz=f_spins)
+            inclination, M, azimuth=0.0, reference_frequency_hz=f_spins)
 
         def target(grid):
             surrogate = mlgw_bns_individual_modes(
@@ -500,11 +503,13 @@ def teobresums_mlgw_precessing_individual_modes(frequency_array, M, q, a_1, a_2,
             P = dataclasses.replace(P, time_reference_frequency_hz=time_reference[0],
                                     merger_time=-time_reference[1])
         precessing = PrecessingModel(model)
+        # P.azimuth is LALSuite's pi/2, which is also the internal azimuth
+        # that transported and TEOBResumSRun take (mlgw_bns.conventions)
         return TEOBResumSRun(model, transported(P, f_spins), f0, f_min,
                              lambda grid: precessing.predict(grid, P), time_reference)
 
-    # hx with LALSuite's sign, as mlgw_bns_precessing_individual_modes
-    return _source(_run(binary, make), binary, freqs, in_band, modes, -1)
+    # hx as mlgw_bns_precessing_individual_modes (mlgw_bns' own, LALSuite's sign)
+    return _source(_run(binary, make), binary, freqs, in_band, modes, 1)
 
 
 teobresums_mlgw_precessing_individual_modes.evaluates_on_bin_edges = True
